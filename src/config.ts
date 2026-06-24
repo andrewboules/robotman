@@ -1,0 +1,80 @@
+/**
+ * AUTH & SECRETS / CONFIG
+ * -----------------------
+ * Single place that reads environment variables. In production this is where
+ * you'd plug a real secrets manager (Vault, AWS Secrets Manager, Doppler) and
+ * per-source OAuth token refresh. For the slice we read from process.env / .env.
+ */
+import "dotenv/config";
+
+function required(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing required env var: ${name}`);
+  return v;
+}
+
+function optional(name: string, fallback = ""): string {
+  return process.env[name] ?? fallback;
+}
+
+export const config = {
+  /** If set (production), use Postgres. If empty, fall back to SQLite. */
+  databaseUrl: optional("DATABASE_URL"),
+  /** SQLite file used only when DATABASE_URL is not set. */
+  databaseFile: optional("DATABASE_FILE", "data/orchestration.db"),
+
+  ashby: {
+    /** Ashby uses HTTP Basic auth: API key as username, blank password. */
+    apiKey: optional("ASHBY_API_KEY"),
+    baseUrl: optional("ASHBY_BASE_URL", "https://api.ashbyhq.com"),
+    get configured(): boolean {
+      return Boolean(process.env.ASHBY_API_KEY);
+    },
+  },
+
+  gem: {
+    /** Gem is fronted by AWS API Gateway; auth via `x-api-key` header. */
+    apiKey: optional("GEM_API_KEY"),
+    baseUrl: optional("GEM_BASE_URL", "https://api.gem.com"),
+    get configured(): boolean {
+      return Boolean(process.env.GEM_API_KEY);
+    },
+  },
+
+  slack: {
+    botToken: optional("SLACK_BOT_TOKEN"),
+    signingSecret: optional("SLACK_SIGNING_SECRET"),
+    appToken: optional("SLACK_APP_TOKEN"), // for Socket Mode
+    get configured(): boolean {
+      return Boolean(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN);
+    },
+  },
+
+  anthropic: {
+    apiKey: optional("ANTHROPIC_API_KEY"),
+    /** Model used for the agent loop. */
+    model: optional("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+    maxTokens: Number(optional("ANTHROPIC_MAX_TOKENS", "2048")),
+    /** Safety cap on tool-call rounds per user message. */
+    maxToolRounds: Number(optional("AGENT_MAX_TOOL_ROUNDS", "6")),
+    get configured(): boolean {
+      return Boolean(process.env.ANTHROPIC_API_KEY);
+    },
+  },
+
+  /** Public base URLs used to build citation links back to each source. */
+  links: {
+    ashbyApp: optional("ASHBY_APP_URL", "https://app.ashbyhq.com"),
+    gemApp: optional("GEM_APP_URL", "https://www.gem.com"),
+  },
+
+  /** Cron schedule for the background sync. Default: every 15 minutes. */
+  syncCron: optional("SYNC_CRON", "*/15 * * * *"),
+
+  /** A candidate in an active stage with no activity for this many days is "stale". */
+  staleAfterDays: Number(optional("STALE_AFTER_DAYS", "7")),
+
+  port: Number(optional("PORT", "3000")),
+};
+
+export { required };
