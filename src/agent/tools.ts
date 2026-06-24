@@ -223,6 +223,114 @@ const connectIntegration: AgentTool = {
   },
 };
 
+export type AuthStyle = "bearer" | "x-api-key" | "basic" | "query";
+
+/**
+ * Build the request URL, restricted to the credential's own host (prevents the
+ * agent from sending a user's key to an arbitrary server). `path` may be a path
+ * relative to the base URL or a full URL on the same host. HTTPS only.
+ */
+export function resolveApiUrl(baseUrl: string, path: string): URL {
+  const base = new URL(baseUrl);
+  const baseStr = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
+  const url = /^https?:\/\//i.test(path) ? new URL(path) : new URL(path.replace(/^\//, ""), baseStr);
+  if (url.protocol !== "https:") throw new Error("Only https requests are allowed.");
+  if (url.host !== base.host) {
+    throw new Error(`Refusing to send credentials to ${url.host}; this connection is for ${base.host}.`);
+  }
+  return url;
+}
+
+/** Inject the secret per the chosen auth style. Never logs the secret. */
+export function applyAuth(
+  headers: Record<string, string>,
+  url: URL,
+  secret: string,
+  style: AuthStyle,
+  param?: string
+): void {
+  switch (style) {
+    case "x-api-key":
+      headers[param || "x-api-key"] = secret;
+      break;
+    case "basic":
+      headers["Authorization"] = `Basic ${Buffer.from(`${secret}:`).toString("base64")}`;
+      break;
+    case "query":
+      url.searchParams.set(param || "api_key", secret);
+      break;
+    case "bearer":
+    default:
+      headers["Authorization"] = `Bearer ${secret}`;
+  }
+}
+
+const MAX_BODY_CHARS = 6000;
+
+const apiRequest: AgentTool = {
+  def: {
+    name: "api_request",
+    description:
+      "Make a READ-ONLY (GET) request to a connected integration's API using the current user's " +
+      "stored key. Use this to read data from ANY integration the user has connected — including " +
+      "ones without a specialized tool. Check get_my_connections first. You choose the path/query " +
+      "based on your knowledge of that integration's REST API; the request goes to the integration's " +
+      "stored base URL (same host only). Pick auth_style for the API: 'basic' for Ashby, 'x-api-key' " +
+      "for Gem, 'bearer' for most token/OAuth APIs. If a call fails, read the error/status and retry " +
+      "with a corrected path or auth_style. Returns HTTP status + response body (truncated).",
+    input_schema: {
+      type: "object",
+      properties: {
+        provider: { type: "string", description: "A connected integration, e.g. 'ashby', 'gmail'." },
+        path: {
+          type: "string",
+          description: "Path under the base URL (e.g. '/v1/messages?q=from:vinay') or full URL on the same host.",
+        },
+        auth_style: {
+          type: "string",
+          enum: ["bearer", "x-api-key", "basic", "query"],
+          description: "How to send the key. Default 'bearer'.",
+        },
+        auth_param: { type: "string", description: "Header/query name for x-api-key or query styles." },
+      },
+      required: ["provider", "path"],
+    },
+  },
+  async run(input, ctx) {
+    const provider = String(input.provider ?? "").toLowerCase().trim();
+    const cred = await ctx.credentials.get(ctx.user.slackUserId, provider);
+    if (!cred) {
+      return { text: `No connection found for "${provider}". Ask the user to connect it (/connect).`, citations: [] };
+    }
+    if (!cred.baseUrl) {
+      return {
+        text: `"${provider}" is connected but has no base URL. Ask the user to reconnect and include the Site/Base URL.`,
+        citations: [],
+      };
+    }
+    let url: URL;
+    try {
+      url = resolveApiUrl(cred.baseUrl, String(input.path ?? ""));
+    } catch (err) {
+      return { text: `Request blocked: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
+    }
+    const headers: Record<string, string> = { Accept: "application/json" };
+    applyAuth(headers, url, cred.secret, (input.auth_style as AuthStyle) ?? "bearer", input.auth_param as string | undefined);
+
+    try {
+      const res = await fetch(url, { method: "GET", headers });
+      const raw = await res.text();
+      const body = raw.length > MAX_BODY_CHARS ? raw.slice(0, MAX_BODY_CHARS) + "\n…[truncated]" : raw;
+      return {
+        text: `HTTP ${res.status} ${res.statusText} from ${provider} (${url.pathname})\n${body}`,
+        citations: [{ label: `${provider} API`, url: `${url.origin}${url.pathname}`, source: provider }],
+      };
+    } catch (err) {
+      return { text: `Request to ${provider} failed: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
+    }
+  },
+};
+
 export const tools: AgentTool[] = [
   searchCandidates,
   getCandidate,
@@ -230,6 +338,7 @@ export const tools: AgentTool[] = [
   findStale,
   getMyConnections,
   connectIntegration,
+  apiRequest,
 ];
 
 export const toolDefs: Anthropic.Tool[] = tools.map((t) => t.def);

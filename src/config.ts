@@ -55,8 +55,8 @@ export const config = {
     /** Model used for the agent loop. */
     model: optional("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
     maxTokens: Number(optional("ANTHROPIC_MAX_TOKENS", "2048")),
-    /** Safety cap on tool-call rounds per user message. */
-    maxToolRounds: Number(optional("AGENT_MAX_TOOL_ROUNDS", "6")),
+    /** Safety cap on tool-call rounds per user message (room to explore APIs). */
+    maxToolRounds: Number(optional("AGENT_MAX_TOOL_ROUNDS", "10")),
     get configured(): boolean {
       return Boolean(process.env.ANTHROPIC_API_KEY);
     },

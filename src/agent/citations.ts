@@ -19,7 +19,8 @@ export interface Citation {
   /** Short label shown to the user, e.g. "Ashby · Ada Lovelace". */
   label: string;
   url: string;
-  source: Source;
+  /** Originating system; a known Source or any connected provider name. */
+  source: Source | string;
 }
 
 export function candidateUrl(c: Candidate): string {
