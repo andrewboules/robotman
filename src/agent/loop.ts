@@ -14,6 +14,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { config } from "../config.js";
 import type { Repository } from "../store/repository.js";
 import type { AppUser } from "../identity/identity.js";
+import type { CredentialService } from "../identity/credentials.js";
 import { toolByName, toolDefs, type ToolContext } from "./tools.js";
 import { renderSources, type Citation } from "./citations.js";
 import {
@@ -30,6 +31,7 @@ export interface AgentDeps {
   createMessage: CreateMessage;
   repo: Repository;
   memory: MemoryStore;
+  credentials: CredentialService;
 }
 
 export interface AgentRequest {
@@ -42,6 +44,8 @@ export interface AgentRequest {
 export interface AgentReply {
   text: string; // final answer including a Sources block when citations exist
   citations: Citation[];
+  /** Set when the agent wants the Slack layer to show a Connect button. */
+  connectProvider?: string;
 }
 
 const SYSTEM_PROMPT = `You are Robot Machine, an AI recruiting-operations partner that lives in Slack.
@@ -56,8 +60,12 @@ Principles you must follow:
   The system appends a Sources list automatically from the records you used, so refer to people
   by name and let the links handle attribution.
 - Ask a brief clarifying question if the request is ambiguous (e.g. two candidates match a name).
-- You are READ-ONLY. You cannot move stages, send email, or change anything yet. If asked to,
-  explain that write actions aren't enabled yet.
+- You are READ-ONLY for source data. You cannot move stages, send email, or change anything yet.
+  If asked to, explain that write actions aren't enabled yet.
+- Connecting integrations: each user connects their OWN API keys. If the user wants data from a
+  source they haven't connected (use get_my_connections to check), or asks to connect one, call
+  connect_integration with the provider name. NEVER ask the user to paste an API key in chat — the
+  Connect button opens a secure form for that.
 - Understand recruiting context: stages flow lead -> applied -> screen -> interview -> offer -> hired;
   "stuck"/"needs follow up"/"slipped" usually means stale active candidates.`;
 
@@ -78,7 +86,13 @@ export async function runAgent(req: AgentRequest, deps: AgentDeps): Promise<Agen
     { role: "user", content: req.text },
   ];
 
-  const toolCtx: ToolContext = { repo: deps.repo, user: req.user };
+  const connectRequest: { provider?: string } = {};
+  const toolCtx: ToolContext = {
+    repo: deps.repo,
+    user: req.user,
+    credentials: deps.credentials,
+    connectRequest,
+  };
   const collectedCitations: Citation[] = [];
 
   for (let round = 0; round < config.anthropic.maxToolRounds; round++) {
@@ -98,7 +112,7 @@ export async function runAgent(req: AgentRequest, deps: AgentDeps): Promise<Agen
         { role: "user", content: req.text },
         { role: "assistant", content: finalText },
       ]);
-      return { text: reply, citations: collectedCitations };
+      return { text: reply, citations: collectedCitations, connectProvider: connectRequest.provider };
     }
 
     // Claude requested one or more tools — execute them and feed results back.

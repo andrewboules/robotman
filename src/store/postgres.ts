@@ -7,8 +7,9 @@
  * implementation, so nothing downstream can tell which store is in use.
  */
 import pg from "pg";
-import type { Repository } from "./repository.js";
+import type { CredentialRow, Repository } from "./repository.js";
 import type { Candidate, Source, Stage, SyncRun } from "../types.js";
+import type { ConnectionInfo } from "../identity/credentials.js";
 
 const { Pool } = pg;
 
@@ -90,6 +91,55 @@ export class PostgresRepository implements Repository {
         error            TEXT
       );
     `);
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS user_credentials (
+        slack_user_id TEXT NOT NULL,
+        provider      TEXT NOT NULL,
+        base_url      TEXT,
+        secret_cipher TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        PRIMARY KEY (slack_user_id, provider)
+      );
+    `);
+  }
+
+  async upsertCredential(row: CredentialRow): Promise<void> {
+    const now = new Date().toISOString();
+    await this.pool.query(
+      `INSERT INTO user_credentials (slack_user_id, provider, base_url, secret_cipher, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $5)
+       ON CONFLICT (slack_user_id, provider) DO UPDATE SET
+         base_url = EXCLUDED.base_url,
+         secret_cipher = EXCLUDED.secret_cipher,
+         updated_at = EXCLUDED.updated_at`,
+      [row.slackUserId, row.provider, row.baseUrl, row.secretCipher, now]
+    );
+  }
+
+  async getCredentialRow(slackUserId: string, provider: string) {
+    const { rows } = await this.pool.query<{ base_url: string | null; secret_cipher: string }>(
+      `SELECT base_url, secret_cipher FROM user_credentials WHERE slack_user_id = $1 AND provider = $2`,
+      [slackUserId, provider]
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return { baseUrl: row.base_url, secretCipher: row.secret_cipher };
+  }
+
+  async listCredentials(slackUserId: string): Promise<ConnectionInfo[]> {
+    const { rows } = await this.pool.query<{ provider: string; base_url: string | null }>(
+      `SELECT provider, base_url FROM user_credentials WHERE slack_user_id = $1 ORDER BY provider`,
+      [slackUserId]
+    );
+    return rows.map((r) => ({ provider: r.provider, baseUrl: r.base_url }));
+  }
+
+  async deleteCredential(slackUserId: string, provider: string): Promise<void> {
+    await this.pool.query(
+      `DELETE FROM user_credentials WHERE slack_user_id = $1 AND provider = $2`,
+      [slackUserId, provider]
+    );
   }
 
   async upsertCandidates(candidates: Candidate[]): Promise<number> {

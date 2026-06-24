@@ -12,6 +12,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Repository } from "../store/repository.js";
 import type { AppUser } from "../identity/identity.js";
+import type { CredentialService } from "../identity/credentials.js";
 import type { Candidate, Stage } from "../types.js";
 import { ACTIVE_STAGES } from "../types.js";
 import { computePipelineMetrics, findStaleCandidates } from "../logic/metrics.js";
@@ -20,6 +21,9 @@ import { candidateCitation, candidateUrl, type Citation } from "./citations.js";
 export interface ToolContext {
   repo: Repository;
   user: AppUser;
+  credentials: CredentialService;
+  /** Mutable: a tool sets `.provider` to make Slack offer a Connect button. */
+  connectRequest: { provider?: string };
 }
 
 export interface ToolResult {
@@ -170,7 +174,63 @@ const findStale: AgentTool = {
   },
 };
 
-export const tools: AgentTool[] = [searchCandidates, getCandidate, pipelineMetrics, findStale];
+const getMyConnections: AgentTool = {
+  def: {
+    name: "get_my_connections",
+    description:
+      "List which integrations the current user has personally connected (their own API keys). " +
+      "Call this when the user asks about a data source to check whether they've connected it yet.",
+    input_schema: { type: "object", properties: {} },
+  },
+  async run(_input, ctx) {
+    const conns = await ctx.credentials.list(ctx.user.slackUserId);
+    if (conns.length === 0) return { text: "The user has not connected any integrations yet.", citations: [] };
+    return {
+      text: "Connected integrations:\n" + conns.map((c) => `- ${c.provider}${c.baseUrl ? ` (${c.baseUrl})` : ""}`).join("\n"),
+      citations: [],
+    };
+  },
+};
+
+const connectIntegration: AgentTool = {
+  def: {
+    name: "connect_integration",
+    description:
+      "Start connecting an integration for the current user. Call this when the user wants data " +
+      "from a source they haven't connected, or explicitly asks to connect one (e.g. 'I want my " +
+      "Granola notes', 'connect Ashby'). This makes the app show a secure Connect button that opens " +
+      "a form asking for their site/base URL and API key — do NOT ask the user to type their API key " +
+      "in chat. Pass the provider name (e.g. 'granola', 'ashby', 'gem').",
+    input_schema: {
+      type: "object",
+      properties: {
+        provider: { type: "string", description: "Integration name, lowercase (e.g. 'granola')." },
+      },
+      required: ["provider"],
+    },
+  },
+  async run(input, ctx) {
+    const provider = String(input.provider ?? "").toLowerCase().trim();
+    if (!provider) return { text: "No provider specified.", citations: [] };
+    if (!ctx.credentials.enabled) {
+      return { text: "Connections are not enabled (CREDENTIAL_ENC_KEY unset). Tell the user to contact an admin.", citations: [] };
+    }
+    ctx.connectRequest.provider = provider;
+    return {
+      text: `Connection flow for "${provider}" started. The app will show the user a Connect button to securely enter their site and API key. Tell them to click it.`,
+      citations: [],
+    };
+  },
+};
+
+export const tools: AgentTool[] = [
+  searchCandidates,
+  getCandidate,
+  pipelineMetrics,
+  findStale,
+  getMyConnections,
+  connectIntegration,
+];
 
 export const toolDefs: Anthropic.Tool[] = tools.map((t) => t.def);
 export const toolByName: Map<string, AgentTool> = new Map(tools.map((t) => [t.def.name, t]));

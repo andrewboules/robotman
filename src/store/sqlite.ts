@@ -10,8 +10,9 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Repository } from "./repository.js";
+import type { CredentialRow, Repository } from "./repository.js";
 import type { Candidate, Source, Stage, SyncRun } from "../types.js";
+import type { ConnectionInfo } from "../identity/credentials.js";
 
 interface CandidateRow {
   id: string;
@@ -84,7 +85,52 @@ export class SqliteRepository implements Repository {
         status           TEXT NOT NULL,
         error            TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS user_credentials (
+        slack_user_id TEXT NOT NULL,
+        provider      TEXT NOT NULL,
+        base_url      TEXT,
+        secret_cipher TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        PRIMARY KEY (slack_user_id, provider)
+      );
     `);
+  }
+
+  async upsertCredential(row: CredentialRow): Promise<void> {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO user_credentials (slack_user_id, provider, base_url, secret_cipher, created_at, updated_at)
+         VALUES (@slackUserId, @provider, @baseUrl, @secretCipher, @now, @now)
+         ON CONFLICT (slack_user_id, provider) DO UPDATE SET
+           base_url = excluded.base_url,
+           secret_cipher = excluded.secret_cipher,
+           updated_at = excluded.updated_at`
+      )
+      .run({ ...row, now });
+  }
+
+  async getCredentialRow(slackUserId: string, provider: string) {
+    const row = this.db
+      .prepare(`SELECT base_url, secret_cipher FROM user_credentials WHERE slack_user_id = ? AND provider = ?`)
+      .get(slackUserId, provider) as { base_url: string | null; secret_cipher: string } | undefined;
+    if (!row) return null;
+    return { baseUrl: row.base_url, secretCipher: row.secret_cipher };
+  }
+
+  async listCredentials(slackUserId: string): Promise<ConnectionInfo[]> {
+    const rows = this.db
+      .prepare(`SELECT provider, base_url FROM user_credentials WHERE slack_user_id = ? ORDER BY provider`)
+      .all(slackUserId) as { provider: string; base_url: string | null }[];
+    return rows.map((r) => ({ provider: r.provider, baseUrl: r.base_url }));
+  }
+
+  async deleteCredential(slackUserId: string, provider: string): Promise<void> {
+    this.db
+      .prepare(`DELETE FROM user_credentials WHERE slack_user_id = ? AND provider = ?`)
+      .run(slackUserId, provider);
   }
 
   async upsertCandidates(candidates: Candidate[]): Promise<number> {

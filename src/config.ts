@@ -68,6 +68,9 @@ export const config = {
     gemApp: optional("GEM_APP_URL", "https://www.gem.com"),
   },
 
+  /** Key used to encrypt per-user credentials at rest. Required for /connect. */
+  credentialEncKey: optional("CREDENTIAL_ENC_KEY"),
+
   /** Cron schedule for the background sync. Default: every 15 minutes. */
   syncCron: optional("SYNC_CRON", "*/15 * * * *"),
 

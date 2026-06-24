@@ -18,6 +18,9 @@ services:
       # Secrets: Render will prompt you to enter these on first deploy.
       - key: ANTHROPIC_API_KEY
         sync: false
+      # Encrypts per-user connection keys. Generate once: `openssl rand -base64 32`.
+      - key: CREDENTIAL_ENC_KEY
+        generateValue: true
       - key: ASHBY_API_KEY
         sync: false
       - key: GEM_API_KEY

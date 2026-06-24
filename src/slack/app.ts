@@ -13,8 +13,10 @@ import type { WebClient } from "@slack/web-api";
 import { config } from "../config.js";
 import type { OrchestrationApi } from "../interface/api.js";
 import type { Agent } from "../agent/index.js";
+import type { CredentialService } from "../identity/credentials.js";
 import { IdentityResolver } from "../identity/identity.js";
 import { formatMetrics, formatStale } from "./format.js";
+import { connectButtonBlocks, registerConnectHandlers } from "./connect.js";
 
 const { App } = bolt;
 
@@ -29,7 +31,7 @@ interface IncomingMessage {
   thread_ts?: string;
 }
 
-export function createSlackApp(api: OrchestrationApi, agent?: Agent) {
+export function createSlackApp(api: OrchestrationApi, agent?: Agent, credentials?: CredentialService) {
   const app = new App({
     token: config.slack.botToken,
     appToken: config.slack.appToken,
@@ -39,10 +41,16 @@ export function createSlackApp(api: OrchestrationApi, agent?: Agent) {
 
   const identity = new IdentityResolver();
 
+  if (credentials?.enabled) registerConnectHandlers(app, credentials);
+
   async function handleConversational(
     m: IncomingMessage,
     client: WebClient,
-    say: (args: { text: string; thread_ts?: string }) => Promise<unknown>
+    say: (args: {
+      text: string;
+      thread_ts?: string;
+      blocks?: unknown[];
+    }) => Promise<unknown>
   ): Promise<void> {
     if (!m.text || !m.user) return;
     if (!agent) {
@@ -62,7 +70,15 @@ export function createSlackApp(api: OrchestrationApi, agent?: Agent) {
         threadTs: m.thread_ts ?? null,
         text: m.text,
       });
-      await say({ text: reply.text, thread_ts: m.thread_ts });
+      // If the agent wants to connect an integration, attach a secure Connect button.
+      const blocks =
+        reply.connectProvider && credentials?.enabled
+          ? [
+              { type: "section", text: { type: "mrkdwn", text: reply.text } },
+              ...connectButtonBlocks(reply.connectProvider),
+            ]
+          : undefined;
+      await say({ text: reply.text, thread_ts: m.thread_ts, blocks });
     } catch (err) {
       await say({
         text: `Sorry — something went wrong: ${err instanceof Error ? err.message : String(err)}`,
@@ -76,7 +92,7 @@ export function createSlackApp(api: OrchestrationApi, agent?: Agent) {
     const m = message as IncomingMessage;
     if (m.subtype || m.bot_id) return; // ignore edits, bot echoes, joins, etc.
     if (m.channel_type !== "im") return; // DMs only for now
-    await handleConversational(m, client, (args) => say(args));
+    await handleConversational(m, client, (args) => say(args as bolt.SayArguments));
   });
 
   // @mentions in channels.
@@ -87,7 +103,7 @@ export function createSlackApp(api: OrchestrationApi, agent?: Agent) {
       channel: (event as { channel: string }).channel,
       thread_ts: (event as { thread_ts?: string }).thread_ts,
     };
-    await handleConversational(m, client, (args) => say(args));
+    await handleConversational(m, client, (args) => say(args as bolt.SayArguments));
   });
 
   // /metrics — quick deterministic pipeline report.

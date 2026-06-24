@@ -9,6 +9,15 @@
  */
 import { config } from "../config.js";
 import type { Candidate, Source, Stage, SyncRun } from "../types.js";
+import type { ConnectionInfo } from "../identity/credentials.js";
+
+/** A stored, encrypted per-user credential row (secret stays ciphertext here). */
+export interface CredentialRow {
+  slackUserId: string;
+  provider: string;
+  baseUrl: string | null;
+  secretCipher: string;
+}
 
 export interface Repository {
   /** Idempotent setup; safe to call on every boot. */
@@ -24,6 +33,12 @@ export interface Repository {
   startSyncRun(source: Source): Promise<number>;
   finishSyncRun(id: number, recordsUpserted: number, error?: string | null): Promise<void>;
   lastSuccessfulSync(source: Source): Promise<SyncRun | null>;
+
+  // --- per-user encrypted credentials ---
+  upsertCredential(row: CredentialRow): Promise<void>;
+  getCredentialRow(slackUserId: string, provider: string): Promise<{ baseUrl: string | null; secretCipher: string } | null>;
+  listCredentials(slackUserId: string): Promise<ConnectionInfo[]>;
+  deleteCredential(slackUserId: string, provider: string): Promise<void>;
 
   close(): Promise<void>;
 }

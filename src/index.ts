@@ -49,18 +49,26 @@ async function main(): Promise<void> {
 
   if (config.slack.configured) {
     const { createSlackApp } = await import("./slack/app.js");
+    const { CredentialService } = await import("./identity/credentials.js");
+    const { getRepository } = await import("./store/repository.js");
     const api = await OrchestrationApi.create();
+    const credentials = new CredentialService(await getRepository(), config.credentialEncKey);
+    console.log(
+      credentials.enabled
+        ? "[boot] per-user connections enabled (/connect)"
+        : "[boot] CREDENTIAL_ENC_KEY not set — /connect disabled."
+    );
 
     let agent;
     if (config.anthropic.configured) {
       const { Agent } = await import("./agent/index.js");
-      agent = await Agent.create();
+      agent = await Agent.create(credentials);
       console.log("[boot] agent enabled (conversational DMs + @mentions)");
     } else {
       console.log("[boot] ANTHROPIC_API_KEY not set — slash commands only, no conversational agent.");
     }
 
-    const app = createSlackApp(api, agent);
+    const app = createSlackApp(api, agent, credentials);
     await app.start();
     console.log("[boot] ⚡ Slack app running (Socket Mode). DM the bot or try /metrics");
   } else {
