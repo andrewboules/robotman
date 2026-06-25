@@ -71,6 +71,29 @@ export const config = {
   /** Key used to encrypt per-user credentials at rest. Required for /connect. */
   credentialEncKey: optional("CREDENTIAL_ENC_KEY"),
 
+  /** Public base URL of this service (Render injects RENDER_EXTERNAL_URL). */
+  publicUrl: optional("PUBLIC_URL", optional("RENDER_EXTERNAL_URL")),
+
+  google: {
+    clientId: optional("GOOGLE_CLIENT_ID"),
+    clientSecret: optional("GOOGLE_CLIENT_SECRET"),
+    /** Space-separated OAuth scopes. Default = full Gmail + Calendar + Drive. */
+    scopes: optional(
+      "GOOGLE_SCOPES",
+      [
+        "openid",
+        "email",
+        "profile",
+        "https://mail.google.com/", // full Gmail: read, send, modify
+        "https://www.googleapis.com/auth/calendar", // read + write
+        "https://www.googleapis.com/auth/drive", // read + write
+      ].join(" ")
+    ),
+    get configured(): boolean {
+      return Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
+    },
+  },
+
   /** Cron schedule for the background sync. Default: every 15 minutes. */
   syncCron: optional("SYNC_CRON", "*/15 * * * *"),
 

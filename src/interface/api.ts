@@ -36,8 +36,14 @@ export class OrchestrationApi {
   }
 
   async lastSyncInfo(): Promise<{ source: string; finishedAt: string | null; records: number } | null> {
-    const run = await this.repo.lastSuccessfulSync("ashby");
-    if (!run) return null;
+    // Most recent successful sync across the org-key sources.
+    const runs = (await Promise.all([
+      this.repo.lastSuccessfulSync("ashby"),
+      this.repo.lastSuccessfulSync("gem"),
+    ])).filter((r): r is NonNullable<typeof r> => r !== null);
+    if (runs.length === 0) return null;
+    runs.sort((a, b) => (b.finishedAt ?? "").localeCompare(a.finishedAt ?? ""));
+    const run = runs[0];
     return { source: run.source, finishedAt: run.finishedAt, records: run.recordsUpserted };
   }
 }

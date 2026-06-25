@@ -15,6 +15,8 @@ import { config } from "../config.js";
 import type { Repository } from "../store/repository.js";
 import type { AppUser } from "../identity/identity.js";
 import type { CredentialService } from "../identity/credentials.js";
+import type { GoogleAuth } from "../google/oauth.js";
+import type { GmailDraft } from "../google/gmail.js";
 import { toolByName, toolDefs, type ToolContext } from "./tools.js";
 import { renderSources, type Citation } from "./citations.js";
 import {
@@ -32,6 +34,7 @@ export interface AgentDeps {
   repo: Repository;
   memory: MemoryStore;
   credentials: CredentialService;
+  google: GoogleAuth | null;
 }
 
 export interface AgentRequest {
@@ -46,6 +49,8 @@ export interface AgentReply {
   citations: Citation[];
   /** Set when the agent wants the Slack layer to show a Connect button. */
   connectProvider?: string;
+  /** Set when a write tool staged an email; Slack shows Send/Cancel buttons. */
+  pendingSend?: GmailDraft;
 }
 
 const SYSTEM_PROMPT = `You are Robot Machine, an AI recruiting-operations partner that lives in Slack.
@@ -60,8 +65,9 @@ Principles you must follow:
   The system appends a Sources list automatically from the records you used, so refer to people
   by name and let the links handle attribution.
 - Ask a brief clarifying question if the request is ambiguous (e.g. two candidates match a name).
-- You are READ-ONLY for source data. You cannot move stages, send email, or change anything yet.
-  If asked to, explain that write actions aren't enabled yet.
+- Most actions are READ-ONLY. The ONE write action available is sending email via gmail_send, and
+  it is always confirmed by the user before sending (you stage a draft; they press Send). You cannot
+  move stages or change other systems yet.
 
 Connections & data access — read carefully:
 - Each user connects their OWN integrations (an API key + the API base URL). To know what THIS user
@@ -79,9 +85,12 @@ Connections & data access — read carefully:
 - If you genuinely don't know an integration's API or a base URL is missing, ask the user for the
   endpoint or to reconnect with the correct Site/Base URL — don't guess blindly forever (you have a
   limited number of tool calls per message).
-- Caveat to share when relevant: Google services (Gmail, Calendar, Drive) authenticate with OAuth
-  access tokens, not static API keys. A plain key usually returns 401 there; those work best once a
-  Google sign-in token is connected.
+- Google (Gmail/Calendar/Drive): the user connects via Google sign-in (NOT a key). For ANYTHING
+  Gmail/Calendar/Drive, ALWAYS use google_read (read) or gmail_send (send) — NEVER api_request, and
+  IGNORE any key-based "gmail"/"google" entry from get_my_connections (those are stale; google_read
+  uses the proper OAuth sign-in). To send an email, use gmail_send: draft it, show the draft, and it
+  is sent only after the user confirms with the Send button. If google_read/gmail_send say the user
+  isn't connected, offer the Connect Google button (call connect_integration with provider "google").
 - To connect something new, call connect_integration with the provider name. NEVER ask the user to
   paste a key in chat — the Connect button opens a secure form.
 - Recruiting context: stages flow lead -> applied -> screen -> interview -> offer -> hired;
@@ -105,11 +114,14 @@ export async function runAgent(req: AgentRequest, deps: AgentDeps): Promise<Agen
   ];
 
   const connectRequest: { provider?: string } = {};
+  const pendingSend: { draft?: GmailDraft } = {};
   const toolCtx: ToolContext = {
     repo: deps.repo,
     user: req.user,
     credentials: deps.credentials,
+    google: deps.google,
     connectRequest,
+    pendingSend,
   };
   const collectedCitations: Citation[] = [];
 
@@ -130,7 +142,12 @@ export async function runAgent(req: AgentRequest, deps: AgentDeps): Promise<Agen
         { role: "user", content: req.text },
         { role: "assistant", content: finalText },
       ]);
-      return { text: reply, citations: collectedCitations, connectProvider: connectRequest.provider };
+      return {
+        text: reply,
+        citations: collectedCitations,
+        connectProvider: connectRequest.provider,
+        pendingSend: pendingSend.draft,
+      };
     }
 
     // Claude requested one or more tools — execute them and feed results back.

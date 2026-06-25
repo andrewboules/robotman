@@ -18,9 +18,15 @@ services:
       # Secrets: Render will prompt you to enter these on first deploy.
       - key: ANTHROPIC_API_KEY
         sync: false
-      # Encrypts per-user connection keys. Generate once: `openssl rand -base64 32`.
+      # Encrypts per-user connection keys + Google tokens. Auto-generated once.
       - key: CREDENTIAL_ENC_KEY
         generateValue: true
+      # Google OAuth (Gmail/Calendar/Drive). Set redirect URI in Google Console
+      # to https://<your-service>.onrender.com/oauth/google/callback
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
       - key: ASHBY_API_KEY
         sync: false
       - key: GEM_API_KEY

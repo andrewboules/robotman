@@ -51,9 +51,10 @@ export class PostgresRepository implements Repository {
   constructor(connectionString: string) {
     this.pool = new Pool({
       connectionString,
-      // Most managed Postgres (Render, Neon, RDS) require TLS. Allow self-signed
-      // chains used by these providers.
-      ssl: { rejectUnauthorized: false },
+      // Most managed Postgres (Render, Neon, RDS) use TLS with provider-managed
+      // certs. Default to a relaxed chain so it works out of the box; set
+      // PGSSL_STRICT=true to enforce full certificate verification.
+      ssl: process.env.PGSSL_STRICT === "true" ? true : { rejectUnauthorized: false },
       max: 10,
     });
   }

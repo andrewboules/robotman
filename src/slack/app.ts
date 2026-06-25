@@ -8,12 +8,16 @@
  * No business logic lives here; it resolves the user's identity and delegates.
  * Runs in Socket Mode (no public URL needed).
  */
+import { randomUUID } from "node:crypto";
 import bolt from "@slack/bolt";
 import type { WebClient } from "@slack/web-api";
 import { config } from "../config.js";
 import type { OrchestrationApi } from "../interface/api.js";
 import type { Agent } from "../agent/index.js";
 import type { CredentialService } from "../identity/credentials.js";
+import type { GoogleAuth } from "../google/oauth.js";
+import { encodeState } from "../google/oauth.js";
+import { sendGmail, type GmailDraft } from "../google/gmail.js";
 import { IdentityResolver } from "../identity/identity.js";
 import { formatMetrics, formatStale } from "./format.js";
 import { connectButtonBlocks, registerConnectHandlers } from "./connect.js";
@@ -31,7 +35,12 @@ interface IncomingMessage {
   thread_ts?: string;
 }
 
-export function createSlackApp(api: OrchestrationApi, agent?: Agent, credentials?: CredentialService) {
+export function createSlackApp(
+  api: OrchestrationApi,
+  agent?: Agent,
+  credentials?: CredentialService,
+  google?: GoogleAuth | null
+) {
   const app = new App({
     token: config.slack.botToken,
     appToken: config.slack.appToken,
@@ -42,6 +51,93 @@ export function createSlackApp(api: OrchestrationApi, agent?: Agent, credentials
   const identity = new IdentityResolver();
 
   if (credentials?.enabled) registerConnectHandlers(app, credentials);
+
+  // Staged email drafts awaiting Send confirmation, keyed by a short id.
+  const pendingSends = new Map<string, { slackUserId: string; draft: GmailDraft }>();
+
+  function googleConnectBlocks(slackUserId: string): unknown[] | null {
+    if (!google || !config.publicUrl) return null;
+    const startUrl = new URL(`${config.publicUrl.replace(/\/$/, "")}/oauth/google/start`);
+    startUrl.searchParams.set("state", encodeState(slackUserId));
+    const url = startUrl.toString();
+    return [
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            text: { type: "plain_text", text: "Connect Google" },
+            url,
+            style: "primary",
+          },
+        ],
+      },
+    ];
+  }
+
+  function sendConfirmBlocks(text: string, draft: GmailDraft, slackUserId: string): unknown[] {
+    const id = randomUUID();
+    // Bound memory: drop the oldest staged draft if the map grows large.
+    if (pendingSends.size >= 200) {
+      const oldest = pendingSends.keys().next().value;
+      if (oldest) pendingSends.delete(oldest);
+    }
+    pendingSends.set(id, { slackUserId, draft });
+    return [
+      { type: "section", text: { type: "mrkdwn", text } },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*To:* ${draft.to}${draft.cc ? `\n*Cc:* ${draft.cc}` : ""}\n*Subject:* ${draft.subject}\n\n${draft.body}`,
+        },
+      },
+      {
+        type: "actions",
+        elements: [
+          { type: "button", action_id: "gmail_confirm", value: id, style: "primary", text: { type: "plain_text", text: "Send" } },
+          { type: "button", action_id: "gmail_cancel", value: id, style: "danger", text: { type: "plain_text", text: "Cancel" } },
+        ],
+      },
+    ];
+  }
+
+  // Send confirmation — only the drafter can send.
+  app.action("gmail_confirm", async ({ ack, body, action, respond }) => {
+    await ack();
+    const id = (action as { value?: string }).value ?? "";
+    const pending = pendingSends.get(id);
+    const clicker = (body as { user?: { id?: string } }).user?.id;
+    if (!pending || !google) {
+      await respond({ replace_original: true, text: "This draft is no longer available." });
+      return;
+    }
+    if (clicker !== pending.slackUserId) {
+      await respond({ replace_original: false, text: "Only the person who drafted this can send it." });
+      return;
+    }
+    try {
+      const token = await google.getAccessToken(pending.slackUserId);
+      if (!token) {
+        await respond({ replace_original: true, text: "Your Google connection expired — reconnect and try again." });
+        return;
+      }
+      const result = await sendGmail(token, pending.draft);
+      pendingSends.delete(id);
+      await respond({
+        replace_original: true,
+        text: result.ok ? `✅ Sent to ${pending.draft.to}.` : `❌ Send failed (HTTP ${result.status}). ${result.detail.slice(0, 300)}`,
+      });
+    } catch (err) {
+      await respond({ replace_original: true, text: `❌ Send error: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  });
+
+  app.action("gmail_cancel", async ({ ack, action, respond }) => {
+    await ack();
+    pendingSends.delete((action as { value?: string }).value ?? "");
+    await respond({ replace_original: true, text: "🚫 Draft discarded — nothing was sent." });
+  });
 
   async function handleConversational(
     m: IncomingMessage,
@@ -70,14 +166,19 @@ export function createSlackApp(api: OrchestrationApi, agent?: Agent, credentials
         threadTs: m.thread_ts ?? null,
         text: m.text,
       });
-      // If the agent wants to connect an integration, attach a secure Connect button.
-      const blocks =
-        reply.connectProvider && credentials?.enabled
-          ? [
-              { type: "section", text: { type: "mrkdwn", text: reply.text } },
-              ...connectButtonBlocks(reply.connectProvider),
-            ]
-          : undefined;
+      // Attach interactive blocks when the agent staged a send or wants a connect.
+      let blocks: unknown[] | undefined;
+      if (reply.pendingSend) {
+        blocks = sendConfirmBlocks(reply.text, reply.pendingSend, user.slackUserId);
+      } else if (reply.connectProvider === "google") {
+        const g = googleConnectBlocks(user.slackUserId);
+        blocks = g ? [{ type: "section", text: { type: "mrkdwn", text: reply.text } }, ...g] : undefined;
+      } else if (reply.connectProvider && credentials?.enabled) {
+        blocks = [
+          { type: "section", text: { type: "mrkdwn", text: reply.text } },
+          ...connectButtonBlocks(reply.connectProvider),
+        ];
+      }
       await say({ text: reply.text, thread_ts: m.thread_ts, blocks });
     } catch (err) {
       await say({

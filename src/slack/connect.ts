@@ -14,6 +14,7 @@
  */
 import bolt from "@slack/bolt";
 import type { CredentialService } from "../identity/credentials.js";
+import { GOOGLE_ALIASES } from "../agent/tools.js";
 
 const { App } = bolt;
 type App = InstanceType<typeof App>;
@@ -124,6 +125,9 @@ export function registerConnectHandlers(app: App, credentials: CredentialService
 
     const errors: Record<string, string> = {};
     if (!provider) errors.provider_block = "Enter the integration name.";
+    if (GOOGLE_ALIASES.has(provider)) {
+      errors.provider_block = "Google services use the Connect Google button, not an API key.";
+    }
     if (!apiKey) errors.key_block = "Enter your API key.";
     if (Object.keys(errors).length > 0) {
       await ack({ response_action: "errors", errors });

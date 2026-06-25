@@ -17,13 +17,19 @@ import type { Candidate, Stage } from "../types.js";
 import { ACTIVE_STAGES } from "../types.js";
 import { computePipelineMetrics, findStaleCandidates } from "../logic/metrics.js";
 import { candidateCitation, candidateUrl, type Citation } from "./citations.js";
+import type { GoogleAuth } from "../google/oauth.js";
+import { googleApiGet, type GmailDraft } from "../google/gmail.js";
 
 export interface ToolContext {
   repo: Repository;
   user: AppUser;
   credentials: CredentialService;
+  /** Google token provider; null when Google OAuth isn't configured. */
+  google: GoogleAuth | null;
   /** Mutable: a tool sets `.provider` to make Slack offer a Connect button. */
   connectRequest: { provider?: string };
+  /** Mutable: a write tool stages a draft here for Slack to confirm. */
+  pendingSend: { draft?: GmailDraft };
 }
 
 export interface ToolResult {
@@ -116,13 +122,12 @@ const getCandidate: AgentTool = {
       (id && all.find((c) => c.id === id)) ||
       (name && all.find((c) => c.name.toLowerCase().includes(name)));
     if (!found) return { text: "No candidate matched that id or name.", citations: [] };
-    const detail = {
-      ...found,
-      // raw holds the source's full record (timeline, stage history, etc.).
-      raw: found.raw ?? "(no raw payload stored)",
-    };
+    // Return only normalized fields — never the raw source payload, which can
+    // contain extra PII (phone, salary, private notes) beyond what's modeled.
+    const safe = { ...found };
+    delete safe.raw;
     return {
-      text: `Candidate detail (JSON):\n${JSON.stringify(detail, null, 2)}`,
+      text: `Candidate detail (JSON):\n${JSON.stringify(safe, null, 2)}`,
       citations: [candidateCitation(found)],
     };
   },
@@ -210,11 +215,13 @@ const connectIntegration: AgentTool = {
     },
   },
   async run(input, ctx) {
-    const provider = String(input.provider ?? "").toLowerCase().trim();
+    let provider = String(input.provider ?? "").toLowerCase().trim();
     if (!provider) return { text: "No provider specified.", citations: [] };
     if (!ctx.credentials.enabled) {
       return { text: "Connections are not enabled (CREDENTIAL_ENC_KEY unset). Tell the user to contact an admin.", citations: [] };
     }
+    // Gmail/Calendar/Drive all connect through Google OAuth, not a key.
+    if (GOOGLE_ALIASES.has(provider)) provider = "google";
     ctx.connectRequest.provider = provider;
     return {
       text: `Connection flow for "${provider}" started. The app will show the user a Connect button to securely enter their site and API key. Tell them to click it.`,
@@ -223,12 +230,41 @@ const connectIntegration: AgentTool = {
   },
 };
 
+/** Provider names that mean "Google" — these go through OAuth, never a key. */
+export const GOOGLE_ALIASES = new Set([
+  "google",
+  "gmail",
+  "gcal",
+  "googlecalendar",
+  "calendar",
+  "gdrive",
+  "drive",
+  "googledrive",
+]);
+
 export type AuthStyle = "bearer" | "x-api-key" | "basic" | "query";
+
+/** Block requests to loopback / private / cloud-metadata addresses (SSRF guard). */
+export function isBlockedHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "").split(":")[0];
+  if (h === "localhost" || h === "metadata.google.internal" || h === "::1") return true;
+  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    if (a === 0 || a === 127 || a === 10) return true; // this-host, loopback, private
+    if (a === 169 && b === 254) return true; // link-local + cloud metadata (169.254.169.254)
+    if (a === 192 && b === 168) return true; // private
+    if (a === 172 && b >= 16 && b <= 31) return true; // private
+  }
+  return false;
+}
 
 /**
  * Build the request URL, restricted to the credential's own host (prevents the
- * agent from sending a user's key to an arbitrary server). `path` may be a path
- * relative to the base URL or a full URL on the same host. HTTPS only.
+ * agent from sending a user's key to an arbitrary server) and to public hosts
+ * (SSRF guard). `path` may be relative to the base URL or a full URL on the same
+ * host. HTTPS only.
  */
 export function resolveApiUrl(baseUrl: string, path: string): URL {
   const base = new URL(baseUrl);
@@ -238,6 +274,7 @@ export function resolveApiUrl(baseUrl: string, path: string): URL {
   if (url.host !== base.host) {
     throw new Error(`Refusing to send credentials to ${url.host}; this connection is for ${base.host}.`);
   }
+  if (isBlockedHost(url.host)) throw new Error("Refusing to call a private/internal address.");
   return url;
 }
 
@@ -298,6 +335,12 @@ const apiRequest: AgentTool = {
   },
   async run(input, ctx) {
     const provider = String(input.provider ?? "").toLowerCase().trim();
+    if (GOOGLE_ALIASES.has(provider)) {
+      return {
+        text: "For Gmail, Calendar, or Drive, use the google_read tool (it uses the user's Google sign-in), not api_request.",
+        citations: [],
+      };
+    }
     const cred = await ctx.credentials.get(ctx.user.slackUserId, provider);
     if (!cred) {
       return { text: `No connection found for "${provider}". Ask the user to connect it (/connect).`, citations: [] };
@@ -331,6 +374,83 @@ const apiRequest: AgentTool = {
   },
 };
 
+const googleRead: AgentTool = {
+  def: {
+    name: "google_read",
+    description:
+      "READ from the current user's connected Google account (Gmail, Calendar, Drive) with a GET to " +
+      "the Google REST API. Use for 'find an email from X', 'what's on my calendar', 'find a doc'. " +
+      "Examples: Gmail search → '/gmail/v1/users/me/messages?q=from:vinay'; a message → " +
+      "'/gmail/v1/users/me/messages/{id}'; Calendar → " +
+      "'/calendar/v3/calendars/primary/events?timeMin=...'; Drive → '/drive/v3/files?q=...'. " +
+      "Host must be *.googleapis.com. Requires the user to have connected Google.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Google API path or full https://*.googleapis.com URL." },
+      },
+      required: ["path"],
+    },
+  },
+  async run(input, ctx) {
+    if (!ctx.google) return { text: "Google isn't configured on this server.", citations: [] };
+    const token = await ctx.google.getAccessToken(ctx.user.slackUserId);
+    if (!token) {
+      ctx.connectRequest.provider = "google";
+      return { text: "The user hasn't connected Google yet. Offer them the Connect Google button.", citations: [] };
+    }
+    try {
+      const r = await googleApiGet(token, String(input.path ?? ""));
+      return {
+        text: `HTTP ${r.status} from Google (${new URL(r.url).pathname})\n${r.body}`,
+        citations: [{ label: "Google", url: r.url, source: "google" }],
+      };
+    } catch (err) {
+      return { text: `Google read failed: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
+    }
+  },
+};
+
+const gmailSend: AgentTool = {
+  def: {
+    name: "gmail_send",
+    description:
+      "Prepare an email to send from the user's Gmail. This does NOT send immediately — it stages a " +
+      "draft and the user must confirm with a Send button in Slack. Use after drafting an email the " +
+      "user asked for. Always show the user the draft in your reply too.",
+    input_schema: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "Recipient email address." },
+        subject: { type: "string" },
+        body: { type: "string", description: "Plain-text email body." },
+        cc: { type: "string", description: "Optional CC address(es)." },
+      },
+      required: ["to", "subject", "body"],
+    },
+  },
+  async run(input, ctx) {
+    if (!ctx.google) return { text: "Google isn't configured on this server.", citations: [] };
+    const token = await ctx.google.getAccessToken(ctx.user.slackUserId);
+    if (!token) {
+      ctx.connectRequest.provider = "google";
+      return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
+    }
+    const draft: GmailDraft = {
+      to: String(input.to ?? ""),
+      subject: String(input.subject ?? ""),
+      body: String(input.body ?? ""),
+      cc: input.cc ? String(input.cc) : undefined,
+    };
+    if (!draft.to || !draft.body) return { text: "Need at least a recipient and a body.", citations: [] };
+    ctx.pendingSend.draft = draft; // Slack will render Send/Cancel buttons.
+    return {
+      text: `Draft staged for ${draft.to} (subject: "${draft.subject}"). Tell the user to review it and press Send to confirm — it has NOT been sent yet.`,
+      citations: [],
+    };
+  },
+};
+
 export const tools: AgentTool[] = [
   searchCandidates,
   getCandidate,
@@ -339,6 +459,8 @@ export const tools: AgentTool[] = [
   getMyConnections,
   connectIntegration,
   apiRequest,
+  googleRead,
+  gmailSend,
 ];
 
 export const toolDefs: Anthropic.Tool[] = tools.map((t) => t.def);

@@ -9,6 +9,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { config } from "../config.js";
 import { getRepository } from "../store/repository.js";
 import { CredentialService } from "../identity/credentials.js";
+import { GoogleAuth } from "../google/oauth.js";
 import { InMemoryMemoryStore, type MemoryStore } from "./memory.js";
 import { runAgent, type AgentDeps, type AgentReply, type AgentRequest } from "./loop.js";
 
@@ -25,11 +26,13 @@ export class Agent {
     const client = new Anthropic({ apiKey: config.anthropic.apiKey });
     const repo = await getRepository();
     const creds = credentials ?? new CredentialService(repo, config.credentialEncKey);
+    const google = config.google.configured ? new GoogleAuth(creds) : null;
     return new Agent({
       createMessage: (body) => client.messages.create(body),
       repo,
       memory,
       credentials: creds,
+      google,
     });
   }
 
