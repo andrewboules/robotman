@@ -18,7 +18,14 @@ import { ACTIVE_STAGES } from "../types.js";
 import { computePipelineMetrics, findStaleCandidates } from "../logic/metrics.js";
 import { candidateCitation, candidateUrl, type Citation } from "./citations.js";
 import type { GoogleAuth } from "../google/oauth.js";
-import { googleApiGet, type GmailDraft } from "../google/gmail.js";
+import {
+  googleApiGet,
+  gcalListEvents,
+  gcalFindSlots,
+  driveSearch,
+  driveReadFile,
+  type GmailDraft,
+} from "../google/gmail.js";
 
 export interface ToolContext {
   repo: Repository;
@@ -26,8 +33,9 @@ export interface ToolContext {
   credentials: CredentialService;
   /** Google token provider; null when Google OAuth isn't configured. */
   google: GoogleAuth | null;
-  /** Mutable: a tool sets `.provider` to make Slack offer a Connect button. */
-  connectRequest: { provider?: string };
+  /** Mutable: tools add provider names here to make Slack offer Connect buttons.
+   *  Supports multiple (e.g. a client switch reconnects ashby + google at once). */
+  connectRequest: { providers: string[] };
   /** Mutable: a write tool stages a draft here for Slack to confirm. */
   pendingSend: { draft?: GmailDraft };
 }
@@ -40,6 +48,11 @@ export interface ToolResult {
 export interface AgentTool {
   def: Anthropic.Tool;
   run(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
+}
+
+/** Queue a provider for a Slack Connect button (deduped). */
+function requestConnect(ctx: ToolContext, provider: string): void {
+  if (!ctx.connectRequest.providers.includes(provider)) ctx.connectRequest.providers.push(provider);
 }
 
 function describe(c: Candidate): string {
@@ -222,7 +235,7 @@ const connectIntegration: AgentTool = {
     }
     // Gmail/Calendar/Drive all connect through Google OAuth, not a key.
     if (GOOGLE_ALIASES.has(provider)) provider = "google";
-    ctx.connectRequest.provider = provider;
+    requestConnect(ctx, provider);
     return {
       text: `Connection flow for "${provider}" started. The app will show the user a Connect button to securely enter their site and API key. Tell them to click it.`,
       citations: [],
@@ -396,7 +409,7 @@ const googleRead: AgentTool = {
     if (!ctx.google) return { text: "Google isn't configured on this server.", citations: [] };
     const token = await ctx.google.getAccessToken(ctx.user.slackUserId);
     if (!token) {
-      ctx.connectRequest.provider = "google";
+      requestConnect(ctx, "google");
       return { text: "The user hasn't connected Google yet. Offer them the Connect Google button.", citations: [] };
     }
     try {
@@ -433,7 +446,7 @@ const gmailSend: AgentTool = {
     if (!ctx.google) return { text: "Google isn't configured on this server.", citations: [] };
     const token = await ctx.google.getAccessToken(ctx.user.slackUserId);
     if (!token) {
-      ctx.connectRequest.provider = "google";
+      requestConnect(ctx, "google");
       return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
     }
     const draft: GmailDraft = {
@@ -451,6 +464,290 @@ const gmailSend: AgentTool = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Google Calendar tools
+// ---------------------------------------------------------------------------
+
+/** Shared helper: get a valid Google token or return a not-connected result. */
+async function getGoogleToken(ctx: ToolContext): Promise<string | null> {
+  if (!ctx.google) return null;
+  const token = await ctx.google.getAccessToken(ctx.user.slackUserId);
+  if (!token) requestConnect(ctx, "google");
+  return token;
+}
+
+const gcalListEventsTool: AgentTool = {
+  def: {
+    name: "gcal_list_events",
+    description:
+      "List Google Calendar events in a time window. Use for 'what's on my calendar', " +
+      "'when is the interview for X', 'show me this week's interviews', or any question " +
+      "about scheduled meetings or events. Supports an optional keyword search (q) that " +
+      "matches against event title, description, location, and attendees — great for " +
+      "finding all events related to a specific candidate by name.",
+    input_schema: {
+      type: "object",
+      properties: {
+        time_min: {
+          type: "string",
+          description: "Start of window, ISO 8601 (e.g. '2025-06-01T00:00:00Z'). Default: now.",
+        },
+        time_max: {
+          type: "string",
+          description: "End of window, ISO 8601. Default: 7 days from now.",
+        },
+        q: {
+          type: "string",
+          description: "Free-text search — candidate name, event title keyword, etc.",
+        },
+        calendar_id: {
+          type: "string",
+          description: "Calendar to query. Default: 'primary'.",
+        },
+        max_results: {
+          type: "number",
+          description: "Max events to return (default 25, max 50).",
+        },
+      },
+    },
+  },
+  async run(input, ctx) {
+    const token = await getGoogleToken(ctx);
+    if (!token) {
+      return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
+    }
+
+    const now = new Date();
+    const timeMin = String(input.time_min ?? now.toISOString());
+    const timeMax = String(
+      input.time_max ?? new Date(now.getTime() + 7 * 24 * 60 * 60_000).toISOString()
+    );
+
+    try {
+      const { events, status } = await gcalListEvents(token, {
+        calendarId: input.calendar_id ? String(input.calendar_id) : undefined,
+        timeMin,
+        timeMax,
+        q: input.q ? String(input.q) : undefined,
+        maxResults: input.max_results ? Math.min(Number(input.max_results), 50) : 25,
+      });
+
+      if (status === 401 || status === 403) {
+        requestConnect(ctx, "google");
+        return { text: "Google Calendar access was denied — the user may need to reconnect Google.", citations: [] };
+      }
+      if (events.length === 0) {
+        return { text: `No calendar events found between ${timeMin} and ${timeMax}${input.q ? ` matching "${input.q}"` : ""}.`, citations: [] };
+      }
+
+      const lines = events.map((e) => {
+        const attendeeStr = e.attendees.length ? ` | attendees: ${e.attendees.join(", ")}` : "";
+        const loc = e.location ? ` | location: ${e.location}` : "";
+        return `• ${e.summary} | start: ${e.start} | end: ${e.end}${loc}${attendeeStr} | link: ${e.htmlLink}`;
+      });
+
+      return {
+        text: `${events.length} event(s) found:\n${lines.join("\n")}`,
+        citations: events.map((e) => ({
+          label: e.summary,
+          url: e.htmlLink,
+          source: "gcal",
+        })),
+      };
+    } catch (err) {
+      return { text: `Calendar error: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
+    }
+  },
+};
+
+const gcalFindAvailabilityTool: AgentTool = {
+  def: {
+    name: "gcal_find_availability",
+    description:
+      "Find free time slots in the user's primary Google Calendar — use when scheduling " +
+      "an interview or checking availability. Returns gaps of at least `min_minutes` " +
+      "that fall within the requested window. Good for questions like 'when is Harrison " +
+      "free this week' or 'find a 45-minute slot Thursday afternoon'.",
+    input_schema: {
+      type: "object",
+      properties: {
+        time_min: {
+          type: "string",
+          description: "Start of the window to search, ISO 8601. Default: now.",
+        },
+        time_max: {
+          type: "string",
+          description: "End of the window, ISO 8601. Default: 5 business days from now.",
+        },
+        min_minutes: {
+          type: "number",
+          description: "Minimum slot length in minutes (default 30).",
+        },
+      },
+    },
+  },
+  async run(input, ctx) {
+    const token = await getGoogleToken(ctx);
+    if (!token) {
+      return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
+    }
+
+    const now = new Date();
+    const timeMin = String(input.time_min ?? now.toISOString());
+    const timeMax = String(
+      input.time_max ?? new Date(now.getTime() + 5 * 24 * 60 * 60_000).toISOString()
+    );
+    const minMinutes = input.min_minutes ? Number(input.min_minutes) : 30;
+
+    try {
+      const { slots, status } = await gcalFindSlots(token, { timeMin, timeMax, minMinutes });
+
+      if (status === 401 || status === 403) {
+        requestConnect(ctx, "google");
+        return { text: "Google Calendar access denied — the user may need to reconnect Google.", citations: [] };
+      }
+      if (slots.length === 0) {
+        return { text: `No free slots of ${minMinutes}+ minutes found between ${timeMin} and ${timeMax}.`, citations: [] };
+      }
+
+      const lines = slots.map(
+        (s) => `• ${s.start} → ${s.end} (${s.durationMinutes} min free)`
+      );
+      return {
+        text: `${slots.length} free slot(s) of ${minMinutes}+ min:\n${lines.join("\n")}`,
+        citations: [],
+      };
+    } catch (err) {
+      return { text: `Availability check error: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Google Drive tools
+// ---------------------------------------------------------------------------
+
+const driveSearchTool: AgentTool = {
+  def: {
+    name: "drive_search",
+    description:
+      "Search Google Drive for files by name or content. Use for 'find the JD for X role', " +
+      "'look up the scorecard template', 'find a doc about candidate Y', or any question " +
+      "that requires locating a file. Returns file names, types, last-modified dates, and " +
+      "view links. Follow up with drive_read_file to read the contents.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Keywords to search for in file names and content.",
+        },
+        max_results: {
+          type: "number",
+          description: "Max files to return (default 10).",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  async run(input, ctx) {
+    const token = await getGoogleToken(ctx);
+    if (!token) {
+      return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
+    }
+
+    const q = String(input.query ?? "").trim();
+    if (!q) return { text: "No search query provided.", citations: [] };
+
+    try {
+      const { files, status } = await driveSearch(token, {
+        q,
+        maxResults: input.max_results ? Number(input.max_results) : 10,
+      });
+
+      if (status === 401 || status === 403) {
+        requestConnect(ctx, "google");
+        return { text: "Google Drive access denied — the user may need to reconnect Google.", citations: [] };
+      }
+      if (files.length === 0) {
+        return { text: `No Drive files found matching "${q}".`, citations: [] };
+      }
+
+      const lines = files.map((f) => {
+        const modified = f.modifiedTime ? ` | modified: ${f.modifiedTime.slice(0, 10)}` : "";
+        const link = f.webViewLink ? ` | link: ${f.webViewLink}` : "";
+        return `• [${f.id}] ${f.name} (${f.mimeType})${modified}${link}`;
+      });
+
+      return {
+        text: `${files.length} file(s) found for "${q}":\n${lines.join("\n")}\n\nUse drive_read_file with the [id] to read a file's contents.`,
+        citations: files
+          .filter((f) => f.webViewLink)
+          .map((f) => ({ label: f.name, url: f.webViewLink!, source: "drive" })),
+      };
+    } catch (err) {
+      return { text: `Drive search error: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
+    }
+  },
+};
+
+const driveReadFileTool: AgentTool = {
+  def: {
+    name: "drive_read_file",
+    description:
+      "Read the contents of a Google Drive file by its ID (get the ID from drive_search). " +
+      "Google Docs are returned as plain text, Google Sheets as CSV, PDFs as base64. " +
+      "Use to actually read a JD, scorecard, notes doc, or any file found in Drive.",
+    input_schema: {
+      type: "object",
+      properties: {
+        file_id: {
+          type: "string",
+          description: "The Drive file ID (from drive_search results).",
+        },
+      },
+      required: ["file_id"],
+    },
+  },
+  async run(input, ctx) {
+    const token = await getGoogleToken(ctx);
+    if (!token) {
+      return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
+    }
+
+    const fileId = String(input.file_id ?? "").trim();
+    if (!fileId) return { text: "No file_id provided.", citations: [] };
+
+    try {
+      const { file, status, error } = await driveReadFile(token, fileId);
+
+      if (status === 401 || status === 403) {
+        requestConnect(ctx, "google");
+        return { text: "Google Drive access denied — the user may need to reconnect.", citations: [] };
+      }
+      if (!file) {
+        return { text: `Could not read file (HTTP ${status}): ${error ?? "unknown error"}`, citations: [] };
+      }
+
+      const truncNote = file.truncated ? "\n…[content truncated]" : "";
+      const encodingNote = file.encoding === "base64"
+        ? `\n(PDF/binary — base64 encoded, ${file.content.length} chars)`
+        : "";
+
+      const citation = file.webViewLink
+        ? [{ label: file.name, url: file.webViewLink, source: "drive" }]
+        : [];
+
+      return {
+        text: `File: ${file.name} (${file.mimeType})\n\n${file.content}${encodingNote}${truncNote}`,
+        citations: citation,
+      };
+    } catch (err) {
+      return { text: `Drive read error: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
+    }
+  },
+};
+
 export const tools: AgentTool[] = [
   searchCandidates,
   getCandidate,
@@ -461,6 +758,10 @@ export const tools: AgentTool[] = [
   apiRequest,
   googleRead,
   gmailSend,
+  gcalListEventsTool,
+  gcalFindAvailabilityTool,
+  driveSearchTool,
+  driveReadFileTool,
 ];
 
 export const toolDefs: Anthropic.Tool[] = tools.map((t) => t.def);

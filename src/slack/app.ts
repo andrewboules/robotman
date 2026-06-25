@@ -20,7 +20,7 @@ import { encodeState } from "../google/oauth.js";
 import { sendGmail, type GmailDraft } from "../google/gmail.js";
 import { IdentityResolver } from "../identity/identity.js";
 import { formatMetrics, formatStale } from "./format.js";
-import { connectButtonBlocks, registerConnectHandlers } from "./connect.js";
+import { registerConnectHandlers } from "./connect.js";
 
 const { App } = bolt;
 
@@ -55,24 +55,30 @@ export function createSlackApp(
   // Staged email drafts awaiting Send confirmation, keyed by a short id.
   const pendingSends = new Map<string, { slackUserId: string; draft: GmailDraft }>();
 
-  function googleConnectBlocks(slackUserId: string): unknown[] | null {
-    if (!google || !config.publicUrl) return null;
-    const startUrl = new URL(`${config.publicUrl.replace(/\/$/, "")}/oauth/google/start`);
-    startUrl.searchParams.set("state", encodeState(slackUserId));
-    const url = startUrl.toString();
-    return [
-      {
-        type: "actions",
-        elements: [
-          {
-            type: "button",
-            text: { type: "plain_text", text: "Connect Google" },
-            url,
-            style: "primary",
-          },
-        ],
-      },
-    ];
+  /** One Connect button per provider: Google → OAuth URL button; others → key modal. */
+  function connectButtonsFor(providers: string[], slackUserId: string): unknown[] {
+    const buttons: unknown[] = [];
+    for (const provider of providers.slice(0, 5)) {
+      if (provider === "google") {
+        if (!google || !config.publicUrl) continue;
+        const startUrl = new URL(`${config.publicUrl.replace(/\/$/, "")}/oauth/google/start`);
+        startUrl.searchParams.set("state", encodeState(slackUserId));
+        buttons.push({
+          type: "button",
+          text: { type: "plain_text", text: "Connect Google" },
+          url: startUrl.toString(),
+          style: "primary",
+        });
+      } else if (credentials?.enabled) {
+        buttons.push({
+          type: "button",
+          action_id: `connect:${provider}`,
+          text: { type: "plain_text", text: `Connect ${provider}` },
+          style: "primary",
+        });
+      }
+    }
+    return buttons;
   }
 
   function sendConfirmBlocks(text: string, draft: GmailDraft, slackUserId: string): unknown[] {
@@ -166,18 +172,18 @@ export function createSlackApp(
         threadTs: m.thread_ts ?? null,
         text: m.text,
       });
-      // Attach interactive blocks when the agent staged a send or wants a connect.
+      // Attach interactive blocks when the agent staged a send or wants connects.
       let blocks: unknown[] | undefined;
       if (reply.pendingSend) {
         blocks = sendConfirmBlocks(reply.text, reply.pendingSend, user.slackUserId);
-      } else if (reply.connectProvider === "google") {
-        const g = googleConnectBlocks(user.slackUserId);
-        blocks = g ? [{ type: "section", text: { type: "mrkdwn", text: reply.text } }, ...g] : undefined;
-      } else if (reply.connectProvider && credentials?.enabled) {
-        blocks = [
-          { type: "section", text: { type: "mrkdwn", text: reply.text } },
-          ...connectButtonBlocks(reply.connectProvider),
-        ];
+      } else if (reply.connectProviders?.length) {
+        const buttons = connectButtonsFor(reply.connectProviders, user.slackUserId);
+        if (buttons.length) {
+          blocks = [
+            { type: "section", text: { type: "mrkdwn", text: reply.text } },
+            { type: "actions", elements: buttons },
+          ];
+        }
       }
       await say({ text: reply.text, thread_ts: m.thread_ts, blocks });
     } catch (err) {
