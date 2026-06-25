@@ -94,6 +94,30 @@ export const config = {
     },
   },
 
+  /**
+   * Granola meeting-notes integration.
+   * Optional org-wide API key: if set, all users share it.
+   * If not set, each user connects via OAuth SSO (/oauth/granola/start).
+   */
+  granola: {
+    apiKey: optional("GRANOLA_API_KEY"),
+  },
+
+  /**
+   * Proactive notification settings (all optional).
+   *   NOTIFY_STAGE_CHANNEL   — Slack channel ID or user ID to post stage-change
+   *                            alerts. When empty, DMs the candidate's owner instead.
+   *   NOTIFY_EMAIL_QUERY     — Gmail search query to watch (e.g. "from:vip@co.com is:unread").
+   *   NOTIFY_EMAIL_TO        — Slack channel or user ID to DM when matching mail arrives.
+   *   NOTIFY_EMAIL_SLACK_USER_ID — Slack user ID whose connected Gmail account to poll.
+   */
+  notifications: {
+    stageChannel: optional("NOTIFY_STAGE_CHANNEL"),
+    emailQuery: optional("NOTIFY_EMAIL_QUERY"),
+    emailTo: optional("NOTIFY_EMAIL_TO"),
+    emailSlackUserId: optional("NOTIFY_EMAIL_SLACK_USER_ID"),
+  },
+
   /** Cron schedule for the background sync. Default: every 15 minutes. */
   syncCron: optional("SYNC_CRON", "*/15 * * * *"),
 

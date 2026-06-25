@@ -6,10 +6,12 @@
  * here means the Slack handler stays a thin adapter.
  */
 import Anthropic from "@anthropic-ai/sdk";
+import type { WebClient } from "@slack/web-api";
 import { config } from "../config.js";
 import { getRepository } from "../store/repository.js";
 import { CredentialService } from "../identity/credentials.js";
 import { GoogleAuth } from "../google/oauth.js";
+import { GranolaAuth } from "../granola/oauth.js";
 import { InMemoryMemoryStore, type MemoryStore } from "./memory.js";
 import { runAgent, type AgentDeps, type AgentReply, type AgentRequest } from "./loop.js";
 
@@ -18,7 +20,8 @@ export class Agent {
 
   static async create(
     credentials?: CredentialService,
-    memory: MemoryStore = new InMemoryMemoryStore()
+    memory: MemoryStore = new InMemoryMemoryStore(),
+    slackClient?: WebClient | null
   ): Promise<Agent> {
     if (!config.anthropic.configured) {
       throw new Error("ANTHROPIC_API_KEY is required to run the agent.");
@@ -27,12 +30,15 @@ export class Agent {
     const repo = await getRepository();
     const creds = credentials ?? new CredentialService(repo, config.credentialEncKey);
     const google = config.google.configured ? new GoogleAuth(creds) : null;
+    const granolaAuth = creds.enabled ? new GranolaAuth(creds) : null;
     return new Agent({
       createMessage: (body) => client.messages.create(body),
       repo,
       memory,
       credentials: creds,
       google,
+      granolaAuth,
+      slackClient: slackClient ?? null,
     });
   }
 

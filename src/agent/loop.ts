@@ -5,17 +5,20 @@
  * decides which tools to call (planner), we execute them against the store
  * (retriever), feed results back, and Claude composes a final cited answer
  * (synthesizer). Loops until Claude stops requesting tools or we hit the round
- * cap. Read-only: only the tools in tools.ts are exposed.
+ * cap. Read-only: only the tools in tools.ts are exposed (plus gmail_send and
+ * slack_send_dm which are write-but-confirmed).
  *
  * The LLM is injected as `createMessage` so the loop is testable with a fake
  * client (no API key needed to verify control flow + citation collection).
  */
 import type Anthropic from "@anthropic-ai/sdk";
+import type { WebClient } from "@slack/web-api";
 import { config } from "../config.js";
 import type { Repository } from "../store/repository.js";
 import type { AppUser } from "../identity/identity.js";
 import type { CredentialService } from "../identity/credentials.js";
 import type { GoogleAuth } from "../google/oauth.js";
+import type { GranolaAuth } from "../granola/oauth.js";
 import type { GmailDraft } from "../google/gmail.js";
 import { toolByName, toolDefs, type ToolContext } from "./tools.js";
 import { renderSources, type Citation } from "./citations.js";
@@ -35,6 +38,9 @@ export interface AgentDeps {
   memory: MemoryStore;
   credentials: CredentialService;
   google: GoogleAuth | null;
+  granolaAuth: GranolaAuth | null;
+  /** Slack WebClient for the slack_send_dm tool. Optional; null when unavailable. */
+  slackClient?: WebClient | null;
 }
 
 export interface AgentRequest {
@@ -54,8 +60,8 @@ export interface AgentReply {
 }
 
 const SYSTEM_PROMPT = `You are Robot Machine, an AI recruiting-operations partner that lives in Slack.
-You help the recruiting team by answering questions and summarizing information from their
-recruiting stack.
+You help the recruiting team by answering questions, summarizing information, and proactively
+communicating with teammates from their recruiting stack.
 
 Principles you must follow:
 - Use tools to get facts. NEVER fabricate candidate names, stages, dates, or activity.
@@ -65,9 +71,10 @@ Principles you must follow:
   The system appends a Sources list automatically from the records you used, so refer to people
   by name and let the links handle attribution.
 - Ask a brief clarifying question if the request is ambiguous (e.g. two candidates match a name).
-- Most actions are READ-ONLY. The ONE write action available is sending email via gmail_send, and
-  it is always confirmed by the user before sending (you stage a draft; they press Send). You cannot
-  move stages or change other systems yet.
+- Write actions: two write actions are available — gmail_send (staged, confirmed by user before
+  sending) and slack_send_dm (sends a Slack DM immediately from the bot). Both must be used
+  thoughtfully. For slack_send_dm, confirm the message content with the requesting user first
+  unless they explicitly say "just send it".
 
 Connections & data access — read carefully:
 - Each user connects their OWN integrations (an API key + the API base URL). To know what THIS user
@@ -77,7 +84,7 @@ Connections & data access — read carefully:
   1. Specialized tools for Ashby/Gem pipeline data (search_candidates, get_candidate,
      pipeline_metrics, find_stale_candidates) — prefer these for candidate/pipeline questions.
   2. The general api_request tool — a read-only GET to ANY connected integration's API using the
-     user's stored key. Use this for everything else (e.g. "find an email" once Gmail is connected).
+     user's stored key. Use this for everything else.
 - HOW to use api_request: rely on your knowledge of the integration's REST API to choose the path,
   query, and auth_style (basic=Ashby, x-api-key=Gem, bearer=most token/OAuth APIs). Make a request,
   READ the response, and iterate: if you get a 401/403, try a different auth_style; if 404, adjust
@@ -101,8 +108,31 @@ Connections & data access — read carefully:
   - "find the JD for Staff Backend" → drive_search query="Staff Backend JD"
   - "read the scorecard template" → drive_search first, then drive_read_file with the id
   - "find an email from vinay" → google_read with /gmail/v1/users/me/messages?q=from:vinay
+- Granola (meeting notes): use the dedicated Granola tools — do NOT use api_request for Granola.
+  • granola_query is the PREFERRED tool for almost all Granola questions — it understands natural
+    language and searches across ALL meeting notes.
+  • granola_list_meetings to browse what meetings exist (by time range or folder).
+  • granola_get_meeting to pull full details (summary, notes, attendees) for specific meeting IDs.
+  • granola_get_transcript when the user needs verbatim quotes from a meeting.
+  If a Granola tool says the user isn't connected, offer the Connect Granola button
+  (call connect_integration with provider "granola").
+  Routing examples:
+  - "what did we discuss about Tanner in interviews?" → granola_query with that question
+  - "what were the action items from yesterday's debrief?" → granola_query
+  - "show me my meetings this week" → granola_list_meetings with time_range="this_week"
+  - "what exactly did Priya say about the take-home?" → granola_get_transcript
 - To connect something new, call connect_integration with the provider name. NEVER ask the user to
   paste a key in chat — the Connect button opens a secure form.
+
+Slack DMs and notifications:
+- Use slack_send_dm to send a direct message from the bot to any team member. You can look them
+  up by email address or Slack display name.
+- Examples: "tell Sarah the interview is confirmed", "DM john@co.com that the candidate withdrew",
+  "notify the hiring manager that we have 3 new applicants in the screen stage".
+- Always confirm the message text with the requesting user before sending unless they say "just send it".
+- You can also use this proactively: if asked to "alert someone when X happens", note that the
+  system has automatic stage-change and email notifications configured separately — for one-off
+  sends use slack_send_dm.
 
 Multi-client switching — recruiters work across multiple clients, one set of accounts at a time:
 - DETECT SWITCH INTENT: if the user says things like "switch to [client]", "I'm now on [client]",
@@ -144,6 +174,8 @@ export async function runAgent(req: AgentRequest, deps: AgentDeps): Promise<Agen
     user: req.user,
     credentials: deps.credentials,
     google: deps.google,
+    granolaAuth: deps.granolaAuth,
+    slackClient: deps.slackClient ?? null,
     connectRequest,
     pendingSend,
   };
@@ -161,7 +193,6 @@ export async function runAgent(req: AgentRequest, deps: AgentDeps): Promise<Agen
     if (response.stop_reason !== "tool_use") {
       const finalText = textFromContent(response.content) || "(no response)";
       const reply = finalText + renderSources(collectedCitations);
-      // Persist a compact record of the turn (user + final answer) for context.
       await deps.memory.append(key, [
         { role: "user", content: req.text },
         { role: "assistant", content: finalText },

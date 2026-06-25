@@ -3,13 +3,13 @@
  * ---------------------------
  * Each tool exposes a capability to Claude with a JSON schema, and a `run`
  * function that executes against the normalized store and returns text + the
- * citations that back it. Adding a capability = add an AgentTool here. When
- * Gmail/Drive/Calendar adapters land, their tools slot in the same way (and
- * will use the requesting user's OAuth token from the TokenStore).
+ * citations that back it. Adding a capability = add an AgentTool here.
  *
- * v1 tools are read-only by design — no tool can mutate a source system.
+ * v1 tools are read-only by design — except gmail_send (staged, user-confirmed)
+ * and slack_send_dm (sends on behalf of the bot to another user).
  */
 import type Anthropic from "@anthropic-ai/sdk";
+import type { WebClient } from "@slack/web-api";
 import type { Repository } from "../store/repository.js";
 import type { AppUser } from "../identity/identity.js";
 import type { CredentialService } from "../identity/credentials.js";
@@ -18,6 +18,7 @@ import { ACTIVE_STAGES } from "../types.js";
 import { computePipelineMetrics, findStaleCandidates } from "../logic/metrics.js";
 import { candidateCitation, candidateUrl, type Citation } from "./citations.js";
 import type { GoogleAuth } from "../google/oauth.js";
+import type { GranolaAuth } from "../granola/oauth.js";
 import {
   googleApiGet,
   gcalListEvents,
@@ -26,6 +27,13 @@ import {
   driveReadFile,
   type GmailDraft,
 } from "../google/gmail.js";
+import {
+  granolaListMeetings,
+  granolaGetMeetings,
+  granolaGetTranscript,
+  granolaQuery,
+  type GranolaTimeRange,
+} from "../granola/client.js";
 
 export interface ToolContext {
   repo: Repository;
@@ -33,6 +41,10 @@ export interface ToolContext {
   credentials: CredentialService;
   /** Google token provider; null when Google OAuth isn't configured. */
   google: GoogleAuth | null;
+  /** Granola token provider; null when Granola OAuth isn't configured. */
+  granolaAuth: GranolaAuth | null;
+  /** Slack WebClient for DM tools; null when Slack isn't configured. */
+  slackClient: WebClient | null;
   /** Mutable: tools add provider names here to make Slack offer Connect buttons.
    *  Supports multiple (e.g. a client switch reconnects ashby + google at once). */
   connectRequest: { providers: string[] };
@@ -135,8 +147,6 @@ const getCandidate: AgentTool = {
       (id && all.find((c) => c.id === id)) ||
       (name && all.find((c) => c.name.toLowerCase().includes(name)));
     if (!found) return { text: "No candidate matched that id or name.", citations: [] };
-    // Return only normalized fields — never the raw source payload, which can
-    // contain extra PII (phone, salary, private notes) beyond what's modeled.
     const safe = { ...found };
     delete safe.raw;
     return {
@@ -233,7 +243,6 @@ const connectIntegration: AgentTool = {
     if (!ctx.credentials.enabled) {
       return { text: "Connections are not enabled (CREDENTIAL_ENC_KEY unset). Tell the user to contact an admin.", citations: [] };
     }
-    // Gmail/Calendar/Drive all connect through Google OAuth, not a key.
     if (GOOGLE_ALIASES.has(provider)) provider = "google";
     requestConnect(ctx, provider);
     return {
@@ -265,20 +274,14 @@ export function isBlockedHost(host: string): boolean {
   if (m) {
     const a = Number(m[1]);
     const b = Number(m[2]);
-    if (a === 0 || a === 127 || a === 10) return true; // this-host, loopback, private
-    if (a === 169 && b === 254) return true; // link-local + cloud metadata (169.254.169.254)
-    if (a === 192 && b === 168) return true; // private
-    if (a === 172 && b >= 16 && b <= 31) return true; // private
+    if (a === 0 || a === 127 || a === 10) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
   }
   return false;
 }
 
-/**
- * Build the request URL, restricted to the credential's own host (prevents the
- * agent from sending a user's key to an arbitrary server) and to public hosts
- * (SSRF guard). `path` may be relative to the base URL or a full URL on the same
- * host. HTTPS only.
- */
 export function resolveApiUrl(baseUrl: string, path: string): URL {
   const base = new URL(baseUrl);
   const baseStr = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
@@ -291,7 +294,6 @@ export function resolveApiUrl(baseUrl: string, path: string): URL {
   return url;
 }
 
-/** Inject the secret per the chosen auth style. Never logs the secret. */
 export function applyAuth(
   headers: Record<string, string>,
   url: URL,
@@ -351,6 +353,12 @@ const apiRequest: AgentTool = {
     if (GOOGLE_ALIASES.has(provider)) {
       return {
         text: "For Gmail, Calendar, or Drive, use the google_read tool (it uses the user's Google sign-in), not api_request.",
+        citations: [],
+      };
+    }
+    if (provider === "granola") {
+      return {
+        text: "For Granola, use the dedicated granola_* tools — do not use api_request.",
         citations: [],
       };
     }
@@ -456,7 +464,7 @@ const gmailSend: AgentTool = {
       cc: input.cc ? String(input.cc) : undefined,
     };
     if (!draft.to || !draft.body) return { text: "Need at least a recipient and a body.", citations: [] };
-    ctx.pendingSend.draft = draft; // Slack will render Send/Cancel buttons.
+    ctx.pendingSend.draft = draft;
     return {
       text: `Draft staged for ${draft.to} (subject: "${draft.subject}"). Tell the user to review it and press Send to confirm — it has NOT been sent yet.`,
       citations: [],
@@ -465,10 +473,100 @@ const gmailSend: AgentTool = {
 };
 
 // ---------------------------------------------------------------------------
+// Slack DM tool
+// ---------------------------------------------------------------------------
+
+const slackSendDm: AgentTool = {
+  def: {
+    name: "slack_send_dm",
+    description:
+      "Send a direct message to any Slack user by their email address or Slack display name. " +
+      "Use this to notify a recruiter, alert a hiring manager, or relay information to a teammate. " +
+      "Examples: 'tell Sarah the candidate moved to offer', 'DM john@co.com that the interview is confirmed'. " +
+      "The message is sent immediately from the Robotman bot. Always confirm with the requesting user " +
+      "what you are about to send before calling this tool, unless they explicitly ask you to just send it.",
+    input_schema: {
+      type: "object",
+      properties: {
+        to: {
+          type: "string",
+          description: "Recipient's email address (preferred) or Slack display name.",
+        },
+        message: {
+          type: "string",
+          description: "The message text to send. Supports Slack mrkdwn formatting.",
+        },
+      },
+      required: ["to", "message"],
+    },
+  },
+  async run(input, ctx) {
+    if (!ctx.slackClient) {
+      return { text: "Slack client isn't available — cannot send DMs.", citations: [] };
+    }
+    const to = String(input.to ?? "").trim();
+    const message = String(input.message ?? "").trim();
+    if (!to || !message) return { text: "Need both a recipient and a message.", citations: [] };
+
+    let channelId: string | null = null;
+
+    // Try to resolve by email first.
+    if (to.includes("@")) {
+      try {
+        const res = await ctx.slackClient.users.lookupByEmail({ email: to });
+        channelId = res.user?.id ?? null;
+      } catch {
+        // fall through to name lookup
+      }
+    }
+
+    // Fall back: search by display name.
+    if (!channelId) {
+      try {
+        const list = await ctx.slackClient.users.list({});
+        const members = list.members ?? [];
+        const match = members.find(
+          (u) =>
+            u.name?.toLowerCase() === to.toLowerCase() ||
+            u.real_name?.toLowerCase() === to.toLowerCase() ||
+            u.profile?.display_name?.toLowerCase() === to.toLowerCase()
+        );
+        channelId = match?.id ?? null;
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!channelId) {
+      return {
+        text: `Could not find a Slack user matching "${to}". Try using their exact email address.`,
+        citations: [],
+      };
+    }
+
+    try {
+      await ctx.slackClient.chat.postMessage({
+        channel: channelId,
+        text: message,
+        unfurl_links: false,
+      });
+      return {
+        text: `✅ DM sent to ${to}: "${message.slice(0, 100)}${message.length > 100 ? "…" : ""}"`,
+        citations: [],
+      };
+    } catch (err) {
+      return {
+        text: `Failed to send DM: ${err instanceof Error ? err.message : String(err)}`,
+        citations: [],
+      };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Google Calendar tools
 // ---------------------------------------------------------------------------
 
-/** Shared helper: get a valid Google token or return a not-connected result. */
 async function getGoogleToken(ctx: ToolContext): Promise<string | null> {
   if (!ctx.google) return null;
   const token = await ctx.google.getAccessToken(ctx.user.slackUserId);
@@ -488,40 +586,21 @@ const gcalListEventsTool: AgentTool = {
     input_schema: {
       type: "object",
       properties: {
-        time_min: {
-          type: "string",
-          description: "Start of window, ISO 8601 (e.g. '2025-06-01T00:00:00Z'). Default: now.",
-        },
-        time_max: {
-          type: "string",
-          description: "End of window, ISO 8601. Default: 7 days from now.",
-        },
-        q: {
-          type: "string",
-          description: "Free-text search — candidate name, event title keyword, etc.",
-        },
-        calendar_id: {
-          type: "string",
-          description: "Calendar to query. Default: 'primary'.",
-        },
-        max_results: {
-          type: "number",
-          description: "Max events to return (default 25, max 50).",
-        },
+        time_min: { type: "string", description: "Start of window, ISO 8601 (e.g. '2025-06-01T00:00:00Z'). Default: now." },
+        time_max: { type: "string", description: "End of window, ISO 8601. Default: 7 days from now." },
+        q: { type: "string", description: "Free-text search — candidate name, event title keyword, etc." },
+        calendar_id: { type: "string", description: "Calendar to query. Default: 'primary'." },
+        max_results: { type: "number", description: "Max events to return (default 25, max 50)." },
       },
     },
   },
   async run(input, ctx) {
     const token = await getGoogleToken(ctx);
-    if (!token) {
-      return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
-    }
+    if (!token) return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
 
     const now = new Date();
     const timeMin = String(input.time_min ?? now.toISOString());
-    const timeMax = String(
-      input.time_max ?? new Date(now.getTime() + 7 * 24 * 60 * 60_000).toISOString()
-    );
+    const timeMax = String(input.time_max ?? new Date(now.getTime() + 7 * 24 * 60 * 60_000).toISOString());
 
     try {
       const { events, status } = await gcalListEvents(token, {
@@ -548,11 +627,7 @@ const gcalListEventsTool: AgentTool = {
 
       return {
         text: `${events.length} event(s) found:\n${lines.join("\n")}`,
-        citations: events.map((e) => ({
-          label: e.summary,
-          url: e.htmlLink,
-          source: "gcal",
-        })),
+        citations: events.map((e) => ({ label: e.summary, url: e.htmlLink, source: "gcal" })),
       };
     } catch (err) {
       return { text: `Calendar error: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
@@ -566,37 +641,23 @@ const gcalFindAvailabilityTool: AgentTool = {
     description:
       "Find free time slots in the user's primary Google Calendar — use when scheduling " +
       "an interview or checking availability. Returns gaps of at least `min_minutes` " +
-      "that fall within the requested window. Good for questions like 'when is Harrison " +
-      "free this week' or 'find a 45-minute slot Thursday afternoon'.",
+      "that fall within the requested window.",
     input_schema: {
       type: "object",
       properties: {
-        time_min: {
-          type: "string",
-          description: "Start of the window to search, ISO 8601. Default: now.",
-        },
-        time_max: {
-          type: "string",
-          description: "End of the window, ISO 8601. Default: 5 business days from now.",
-        },
-        min_minutes: {
-          type: "number",
-          description: "Minimum slot length in minutes (default 30).",
-        },
+        time_min: { type: "string", description: "Start of the window to search, ISO 8601. Default: now." },
+        time_max: { type: "string", description: "End of the window, ISO 8601. Default: 5 business days from now." },
+        min_minutes: { type: "number", description: "Minimum slot length in minutes (default 30)." },
       },
     },
   },
   async run(input, ctx) {
     const token = await getGoogleToken(ctx);
-    if (!token) {
-      return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
-    }
+    if (!token) return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
 
     const now = new Date();
     const timeMin = String(input.time_min ?? now.toISOString());
-    const timeMax = String(
-      input.time_max ?? new Date(now.getTime() + 5 * 24 * 60 * 60_000).toISOString()
-    );
+    const timeMax = String(input.time_max ?? new Date(now.getTime() + 5 * 24 * 60 * 60_000).toISOString());
     const minMinutes = input.min_minutes ? Number(input.min_minutes) : 30;
 
     try {
@@ -610,13 +671,8 @@ const gcalFindAvailabilityTool: AgentTool = {
         return { text: `No free slots of ${minMinutes}+ minutes found between ${timeMin} and ${timeMax}.`, citations: [] };
       }
 
-      const lines = slots.map(
-        (s) => `• ${s.start} → ${s.end} (${s.durationMinutes} min free)`
-      );
-      return {
-        text: `${slots.length} free slot(s) of ${minMinutes}+ min:\n${lines.join("\n")}`,
-        citations: [],
-      };
+      const lines = slots.map((s) => `• ${s.start} → ${s.end} (${s.durationMinutes} min free)`);
+      return { text: `${slots.length} free slot(s) of ${minMinutes}+ min:\n${lines.join("\n")}`, citations: [] };
     } catch (err) {
       return { text: `Availability check error: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
     }
@@ -632,46 +688,33 @@ const driveSearchTool: AgentTool = {
     name: "drive_search",
     description:
       "Search Google Drive for files by name or content. Use for 'find the JD for X role', " +
-      "'look up the scorecard template', 'find a doc about candidate Y', or any question " +
-      "that requires locating a file. Returns file names, types, last-modified dates, and " +
-      "view links. Follow up with drive_read_file to read the contents.",
+      "'look up the scorecard template', 'find a doc about candidate Y'. " +
+      "Returns file names, types, last-modified dates, and view links. " +
+      "Follow up with drive_read_file to read the contents.",
     input_schema: {
       type: "object",
       properties: {
-        query: {
-          type: "string",
-          description: "Keywords to search for in file names and content.",
-        },
-        max_results: {
-          type: "number",
-          description: "Max files to return (default 10).",
-        },
+        query: { type: "string", description: "Keywords to search for in file names and content." },
+        max_results: { type: "number", description: "Max files to return (default 10)." },
       },
       required: ["query"],
     },
   },
   async run(input, ctx) {
     const token = await getGoogleToken(ctx);
-    if (!token) {
-      return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
-    }
+    if (!token) return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
 
     const q = String(input.query ?? "").trim();
     if (!q) return { text: "No search query provided.", citations: [] };
 
     try {
-      const { files, status } = await driveSearch(token, {
-        q,
-        maxResults: input.max_results ? Number(input.max_results) : 10,
-      });
+      const { files, status } = await driveSearch(token, { q, maxResults: input.max_results ? Number(input.max_results) : 10 });
 
       if (status === 401 || status === 403) {
         requestConnect(ctx, "google");
         return { text: "Google Drive access denied — the user may need to reconnect Google.", citations: [] };
       }
-      if (files.length === 0) {
-        return { text: `No Drive files found matching "${q}".`, citations: [] };
-      }
+      if (files.length === 0) return { text: `No Drive files found matching "${q}".`, citations: [] };
 
       const lines = files.map((f) => {
         const modified = f.modifiedTime ? ` | modified: ${f.modifiedTime.slice(0, 10)}` : "";
@@ -681,9 +724,7 @@ const driveSearchTool: AgentTool = {
 
       return {
         text: `${files.length} file(s) found for "${q}":\n${lines.join("\n")}\n\nUse drive_read_file with the [id] to read a file's contents.`,
-        citations: files
-          .filter((f) => f.webViewLink)
-          .map((f) => ({ label: f.name, url: f.webViewLink!, source: "drive" })),
+        citations: files.filter((f) => f.webViewLink).map((f) => ({ label: f.name, url: f.webViewLink!, source: "drive" })),
       };
     } catch (err) {
       return { text: `Drive search error: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
@@ -696,24 +737,18 @@ const driveReadFileTool: AgentTool = {
     name: "drive_read_file",
     description:
       "Read the contents of a Google Drive file by its ID (get the ID from drive_search). " +
-      "Google Docs are returned as plain text, Google Sheets as CSV, PDFs as base64. " +
-      "Use to actually read a JD, scorecard, notes doc, or any file found in Drive.",
+      "Google Docs are returned as plain text, Google Sheets as CSV, PDFs as base64.",
     input_schema: {
       type: "object",
       properties: {
-        file_id: {
-          type: "string",
-          description: "The Drive file ID (from drive_search results).",
-        },
+        file_id: { type: "string", description: "The Drive file ID (from drive_search results)." },
       },
       required: ["file_id"],
     },
   },
   async run(input, ctx) {
     const token = await getGoogleToken(ctx);
-    if (!token) {
-      return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
-    }
+    if (!token) return { text: "The user hasn't connected Google yet. Offer the Connect Google button.", citations: [] };
 
     const fileId = String(input.file_id ?? "").trim();
     if (!fileId) return { text: "No file_id provided.", citations: [] };
@@ -725,18 +760,11 @@ const driveReadFileTool: AgentTool = {
         requestConnect(ctx, "google");
         return { text: "Google Drive access denied — the user may need to reconnect.", citations: [] };
       }
-      if (!file) {
-        return { text: `Could not read file (HTTP ${status}): ${error ?? "unknown error"}`, citations: [] };
-      }
+      if (!file) return { text: `Could not read file (HTTP ${status}): ${error ?? "unknown error"}`, citations: [] };
 
       const truncNote = file.truncated ? "\n…[content truncated]" : "";
-      const encodingNote = file.encoding === "base64"
-        ? `\n(PDF/binary — base64 encoded, ${file.content.length} chars)`
-        : "";
-
-      const citation = file.webViewLink
-        ? [{ label: file.name, url: file.webViewLink, source: "drive" }]
-        : [];
+      const encodingNote = file.encoding === "base64" ? `\n(PDF/binary — base64 encoded, ${file.content.length} chars)` : "";
+      const citation = file.webViewLink ? [{ label: file.name, url: file.webViewLink, source: "drive" }] : [];
 
       return {
         text: `File: ${file.name} (${file.mimeType})\n\n${file.content}${encodingNote}${truncNote}`,
@@ -748,6 +776,191 @@ const driveReadFileTool: AgentTool = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Granola meeting-notes tools
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a valid Granola access token for this user. Priority:
+ *   1. OAuth token via GranolaAuth (SSO flow — preferred)
+ *   2. Raw API key stored in CredentialService under "granola" (legacy key-based)
+ *   3. Org-wide env var GRANOLA_API_KEY
+ * Queues a connect request and returns null when nothing is available.
+ */
+async function getGranolaToken(ctx: ToolContext): Promise<string | null> {
+  // 1. OAuth SSO token (preferred)
+  if (ctx.granolaAuth) {
+    const token = await ctx.granolaAuth.getAccessToken(ctx.user.slackUserId);
+    if (token) return token;
+  }
+  // 2. Legacy per-user API key
+  try {
+    const cred = await ctx.credentials.get(ctx.user.slackUserId, "granola");
+    if (cred?.secret) return cred.secret;
+  } catch {
+    // not found
+  }
+  // 3. Org-wide env key
+  const { config } = await import("../config.js");
+  if (config.granola.apiKey) return config.granola.apiKey;
+
+  requestConnect(ctx, "granola");
+  return null;
+}
+
+const granolaListMeetingsTool: AgentTool = {
+  def: {
+    name: "granola_list_meetings",
+    description:
+      "List recent Granola meeting notes with titles, dates, and IDs. Use as a starting " +
+      "point to browse what meetings exist before diving into details. Supports time ranges " +
+      "(this_week, last_week, last_30_days, custom). For answering questions ABOUT meeting " +
+      "content, prefer granola_query instead.",
+    input_schema: {
+      type: "object",
+      properties: {
+        time_range: {
+          type: "string",
+          enum: ["this_week", "last_week", "last_30_days", "custom"],
+          description: "Time window to list meetings from. Default: last_30_days.",
+        },
+        custom_start: { type: "string", description: "ISO date (YYYY-MM-DD). Required when time_range is 'custom'." },
+        custom_end: { type: "string", description: "ISO date (YYYY-MM-DD). Required when time_range is 'custom'." },
+        folder_id: { type: "string", description: "Optional — filter to a specific Granola folder." },
+      },
+    },
+  },
+  async run(input, ctx) {
+    const key = await getGranolaToken(ctx);
+    if (!key) return { text: "Granola isn't connected. Offer the Connect Granola button.", citations: [] };
+
+    const result = await granolaListMeetings(key, {
+      time_range: (input.time_range as GranolaTimeRange) ?? "last_30_days",
+      folder_id: input.folder_id ? String(input.folder_id) : undefined,
+      custom_start: input.custom_start ? String(input.custom_start) : undefined,
+      custom_end: input.custom_end ? String(input.custom_end) : undefined,
+    });
+
+    if (result.status === 401 || result.status === 403) {
+      requestConnect(ctx, "granola");
+      return { text: "Granola access denied — the user may need to reconnect Granola.", citations: [] };
+    }
+    return { text: result.text, citations: [] };
+  },
+};
+
+const granolaGetMeetingTool: AgentTool = {
+  def: {
+    name: "granola_get_meeting",
+    description:
+      "Get full details for one or more Granola meetings by ID — includes AI summary, " +
+      "private notes, and attendees. Use after granola_list_meetings to drill into a " +
+      "specific meeting. Pass up to 10 IDs at once.",
+    input_schema: {
+      type: "object",
+      properties: {
+        meeting_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Array of Granola meeting UUIDs (from granola_list_meetings).",
+        },
+      },
+      required: ["meeting_ids"],
+    },
+  },
+  async run(input, ctx) {
+    const key = await getGranolaToken(ctx);
+    if (!key) return { text: "Granola isn't connected. Offer the Connect Granola button.", citations: [] };
+
+    const ids = (input.meeting_ids as string[]) ?? [];
+    if (!ids.length) return { text: "No meeting IDs provided.", citations: [] };
+
+    const result = await granolaGetMeetings(key, ids.slice(0, 10));
+
+    if (result.status === 401 || result.status === 403) {
+      requestConnect(ctx, "granola");
+      return { text: "Granola access denied — the user may need to reconnect Granola.", citations: [] };
+    }
+    return { text: result.text, citations: [] };
+  },
+};
+
+const granolaGetTranscriptTool: AgentTool = {
+  def: {
+    name: "granola_get_transcript",
+    description:
+      "Get the verbatim transcript for a single Granola meeting by ID. Use when the user " +
+      "needs exact quotes or wants to know precisely what was said — not just summaries. " +
+      "For summarized content or action items, use granola_query instead.",
+    input_schema: {
+      type: "object",
+      properties: {
+        meeting_id: { type: "string", description: "The Granola meeting UUID." },
+      },
+      required: ["meeting_id"],
+    },
+  },
+  async run(input, ctx) {
+    const key = await getGranolaToken(ctx);
+    if (!key) return { text: "Granola isn't connected. Offer the Connect Granola button.", citations: [] };
+
+    const meetingId = String(input.meeting_id ?? "").trim();
+    if (!meetingId) return { text: "No meeting_id provided.", citations: [] };
+
+    const result = await granolaGetTranscript(key, meetingId);
+
+    if (result.status === 401 || result.status === 403) {
+      requestConnect(ctx, "granola");
+      return { text: "Granola access denied — the user may need to reconnect Granola.", citations: [] };
+    }
+    return { text: result.text, citations: [] };
+  },
+};
+
+const granolaQueryTool: AgentTool = {
+  def: {
+    name: "granola_query",
+    description:
+      "Search and answer questions across all Granola meeting notes using natural language. " +
+      "This is the PREFERRED Granola tool for most questions — use it for: 'what did we " +
+      "discuss about candidate X', 'what were the action items from my last debrief', " +
+      "'what did the team say about the Staff Backend role', 'summarize recent interview " +
+      "feedback'. Optionally scope to specific meeting IDs.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Natural language question about your meeting notes." },
+        meeting_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional — limit search to specific meeting UUIDs.",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  async run(input, ctx) {
+    const key = await getGranolaToken(ctx);
+    if (!key) return { text: "Granola isn't connected. Offer the Connect Granola button.", citations: [] };
+
+    const query = String(input.query ?? "").trim();
+    if (!query) return { text: "No query provided.", citations: [] };
+
+    const ids = input.meeting_ids ? (input.meeting_ids as string[]) : undefined;
+    const result = await granolaQuery(key, query, ids);
+
+    if (result.status === 401 || result.status === 403) {
+      requestConnect(ctx, "granola");
+      return { text: "Granola access denied — the user may need to reconnect Granola.", citations: [] };
+    }
+    return { text: result.text, citations: [] };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
 export const tools: AgentTool[] = [
   searchCandidates,
   getCandidate,
@@ -758,10 +971,15 @@ export const tools: AgentTool[] = [
   apiRequest,
   googleRead,
   gmailSend,
+  slackSendDm,
   gcalListEventsTool,
   gcalFindAvailabilityTool,
   driveSearchTool,
   driveReadFileTool,
+  granolaListMeetingsTool,
+  granolaGetMeetingTool,
+  granolaGetTranscriptTool,
+  granolaQueryTool,
 ];
 
 export const toolDefs: Anthropic.Tool[] = tools.map((t) => t.def);

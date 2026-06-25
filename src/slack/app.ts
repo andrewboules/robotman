@@ -7,6 +7,14 @@
  *   2. Slash commands — /metrics and /stale for quick deterministic reports.
  * No business logic lives here; it resolves the user's identity and delegates.
  * Runs in Socket Mode (no public URL needed).
+ *
+ * Connect flows supported:
+ *   - Google OAuth  (/oauth/google/start → callback)
+ *   - Granola OAuth (/oauth/granola/start → callback)
+ *   - Any other integration via the /connect modal (API key + base URL)
+ *
+ * `getAgent` is a getter so the agent can be wired after the app is constructed
+ * (avoids the circular: App needs Agent for the client, Agent needs App's client).
  */
 import { randomUUID } from "node:crypto";
 import bolt from "@slack/bolt";
@@ -16,7 +24,9 @@ import type { OrchestrationApi } from "../interface/api.js";
 import type { Agent } from "../agent/index.js";
 import type { CredentialService } from "../identity/credentials.js";
 import type { GoogleAuth } from "../google/oauth.js";
+import type { GranolaAuth } from "../granola/oauth.js";
 import { encodeState } from "../google/oauth.js";
+import { encodeGranolaState, generatePKCE } from "../granola/oauth.js";
 import { sendGmail, type GmailDraft } from "../google/gmail.js";
 import { IdentityResolver } from "../identity/identity.js";
 import { formatMetrics, formatStale } from "./format.js";
@@ -24,7 +34,6 @@ import { registerConnectHandlers } from "./connect.js";
 
 const { App } = bolt;
 
-/** Fields we read off a Slack message event (narrowed from Bolt's union type). */
 interface IncomingMessage {
   subtype?: string;
   bot_id?: string;
@@ -37,9 +46,11 @@ interface IncomingMessage {
 
 export function createSlackApp(
   api: OrchestrationApi,
-  agent?: Agent,
+  /** Getter for the agent — allows wiring after app construction. */
+  getAgent: () => Agent | undefined,
   credentials?: CredentialService,
-  google?: GoogleAuth | null
+  google?: GoogleAuth | null,
+  granolaAuth?: GranolaAuth | null
 ) {
   const app = new App({
     token: config.slack.botToken,
@@ -52,23 +63,51 @@ export function createSlackApp(
 
   if (credentials?.enabled) registerConnectHandlers(app, credentials);
 
-  // Staged email drafts awaiting Send confirmation, keyed by a short id.
+  // Staged email drafts awaiting Send confirmation.
   const pendingSends = new Map<string, { slackUserId: string; draft: GmailDraft }>();
 
-  /** One Connect button per provider: Google → OAuth URL button; others → key modal. */
+  /** Build a Google OAuth connect button for a given Slack user. */
+  function googleConnectBlocks(slackUserId: string): unknown[] | null {
+    if (!google || !config.publicUrl) return null;
+    const startUrl = new URL(`${config.publicUrl.replace(/\/$/, "")}/oauth/google/start`);
+    startUrl.searchParams.set("state", encodeState(slackUserId));
+    return [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "Connect Google" },
+        url: startUrl.toString(),
+        style: "primary",
+      },
+    ];
+  }
+
+  /** Build a Granola OAuth connect button for a given Slack user. */
+  function granolaConnectBlocks(slackUserId: string): unknown[] | null {
+    if (!granolaAuth || !config.publicUrl) return null;
+    const { verifier } = generatePKCE();
+    const state = encodeGranolaState(slackUserId, verifier);
+    const startUrl = new URL(`${config.publicUrl.replace(/\/$/, "")}/oauth/granola/start`);
+    startUrl.searchParams.set("state", state);
+    return [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "Connect Granola" },
+        url: startUrl.toString(),
+        style: "primary",
+      },
+    ];
+  }
+
+  /** One Connect button per provider, routing OAuth providers through their flows. */
   function connectButtonsFor(providers: string[], slackUserId: string): unknown[] {
     const buttons: unknown[] = [];
     for (const provider of providers.slice(0, 5)) {
       if (provider === "google") {
-        if (!google || !config.publicUrl) continue;
-        const startUrl = new URL(`${config.publicUrl.replace(/\/$/, "")}/oauth/google/start`);
-        startUrl.searchParams.set("state", encodeState(slackUserId));
-        buttons.push({
-          type: "button",
-          text: { type: "plain_text", text: "Connect Google" },
-          url: startUrl.toString(),
-          style: "primary",
-        });
+        const b = googleConnectBlocks(slackUserId);
+        if (b) buttons.push(...b);
+      } else if (provider === "granola") {
+        const b = granolaConnectBlocks(slackUserId);
+        if (b) buttons.push(...b);
       } else if (credentials?.enabled) {
         buttons.push({
           type: "button",
@@ -83,7 +122,6 @@ export function createSlackApp(
 
   function sendConfirmBlocks(text: string, draft: GmailDraft, slackUserId: string): unknown[] {
     const id = randomUUID();
-    // Bound memory: drop the oldest staged draft if the map grows large.
     if (pendingSends.size >= 200) {
       const oldest = pendingSends.keys().next().value;
       if (oldest) pendingSends.delete(oldest);
@@ -108,7 +146,6 @@ export function createSlackApp(
     ];
   }
 
-  // Send confirmation — only the drafter can send.
   app.action("gmail_confirm", async ({ ack, body, action, respond }) => {
     await ack();
     const id = (action as { value?: string }).value ?? "";
@@ -148,13 +185,10 @@ export function createSlackApp(
   async function handleConversational(
     m: IncomingMessage,
     client: WebClient,
-    say: (args: {
-      text: string;
-      thread_ts?: string;
-      blocks?: unknown[];
-    }) => Promise<unknown>
+    say: (args: { text: string; thread_ts?: string; blocks?: unknown[] }) => Promise<unknown>
   ): Promise<void> {
     if (!m.text || !m.user) return;
+    const agent = getAgent();
     if (!agent) {
       await say({ text: "The assistant isn't configured yet (missing ANTHROPIC_API_KEY).", thread_ts: m.thread_ts });
       return;
@@ -172,7 +206,7 @@ export function createSlackApp(
         threadTs: m.thread_ts ?? null,
         text: m.text,
       });
-      // Attach interactive blocks when the agent staged a send or wants connects.
+
       let blocks: unknown[] | undefined;
       if (reply.pendingSend) {
         blocks = sendConfirmBlocks(reply.text, reply.pendingSend, user.slackUserId);
@@ -194,15 +228,13 @@ export function createSlackApp(
     }
   }
 
-  // DMs to the bot.
   app.message(async ({ message, client, say }) => {
     const m = message as IncomingMessage;
-    if (m.subtype || m.bot_id) return; // ignore edits, bot echoes, joins, etc.
-    if (m.channel_type !== "im") return; // DMs only for now
+    if (m.subtype || m.bot_id) return;
+    if (m.channel_type !== "im") return;
     await handleConversational(m, client, (args) => say(args as bolt.SayArguments));
   });
 
-  // @mentions in channels.
   app.event("app_mention", async ({ event, client, say }) => {
     const m: IncomingMessage = {
       text: (event as { text?: string }).text,
@@ -213,7 +245,6 @@ export function createSlackApp(
     await handleConversational(m, client, (args) => say(args as bolt.SayArguments));
   });
 
-  // /metrics — quick deterministic pipeline report.
   app.command("/metrics", async ({ ack, respond }) => {
     await ack();
     const metrics = await api.getPipelineMetrics();
@@ -221,7 +252,6 @@ export function createSlackApp(
     await respond({ response_type: "ephemeral", text: formatMetrics(metrics, last) });
   });
 
-  // /stale — stuck-candidate report.
   app.command("/stale", async ({ ack, respond }) => {
     await ack();
     const stale = await api.getStaleCandidates();
