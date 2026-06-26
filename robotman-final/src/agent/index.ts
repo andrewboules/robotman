@@ -13,6 +13,7 @@ import { CredentialService } from "../identity/credentials.js";
 import { GoogleAuth } from "../google/oauth.js";
 import { GranolaAuth } from "../granola/oauth.js";
 import { SlackWorkspaceAuth } from "../slack/workspace-oauth.js";
+import { UserContextService } from "../identity/user-context.js";
 import { InMemoryMemoryStore, type MemoryStore } from "./memory.js";
 import { runAgent, type AgentDeps, type AgentReply, type AgentRequest } from "./loop.js";
 
@@ -23,7 +24,8 @@ export class Agent {
     credentials?: CredentialService,
     memory: MemoryStore = new InMemoryMemoryStore(),
     slackClient?: WebClient | null,
-    slackWorkspaceAuth?: SlackWorkspaceAuth | null
+    slackWorkspaceAuth?: SlackWorkspaceAuth | null,
+    _userContextService?: UserContextService | null  // reserved for future use
   ): Promise<Agent> {
     if (!config.anthropic.configured) {
       throw new Error("ANTHROPIC_API_KEY is required to run the agent.");

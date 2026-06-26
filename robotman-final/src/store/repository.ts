@@ -40,6 +40,9 @@ export interface Repository {
   listCredentials(slackUserId: string): Promise<ConnectionInfo[]>;
   deleteCredential(slackUserId: string, provider: string): Promise<void>;
 
+  // --- per-user persistent context (key-value preferences/notes) ---
+  getUserContext(slackUserId: string): Promise<Record<string, string>>;
+  setUserContext(slackUserId: string, key: string, value: string): Promise<void>;
   close(): Promise<void>;
 }
 

@@ -95,6 +95,14 @@ export class SqliteRepository implements Repository {
         updated_at    TEXT NOT NULL,
         PRIMARY KEY (slack_user_id, provider)
       );
+
+      CREATE TABLE IF NOT EXISTS user_context (
+        slack_user_id TEXT NOT NULL,
+        key           TEXT NOT NULL,
+        value         TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        PRIMARY KEY (slack_user_id, key)
+      );
     `);
   }
 
@@ -131,6 +139,24 @@ export class SqliteRepository implements Repository {
     this.db
       .prepare(`DELETE FROM user_credentials WHERE slack_user_id = ? AND provider = ?`)
       .run(slackUserId, provider);
+  }
+
+  async getUserContext(slackUserId: string): Promise<Record<string, string>> {
+    const rows = this.db
+      .prepare(`SELECT key, value FROM user_context WHERE slack_user_id = ? ORDER BY key`)
+      .all(slackUserId) as { key: string; value: string }[];
+    return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+  }
+
+  async setUserContext(slackUserId: string, key: string, value: string): Promise<void> {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO user_context (slack_user_id, key, value, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (slack_user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(slackUserId, key, value, now);
   }
 
   async upsertCandidates(candidates: Candidate[]): Promise<number> {

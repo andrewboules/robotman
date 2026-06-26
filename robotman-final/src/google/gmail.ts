@@ -83,6 +83,8 @@ export interface CalEvent {
   location: string | null;
   description: string | null;
   htmlLink: string;
+  /** Google Meet or video call link extracted from conferenceData / hangoutLink. */
+  meetLink: string | null;
 }
 
 export interface FreeBusySlot {
@@ -113,6 +115,17 @@ function parseCalEvents(raw: unknown): CalEvent[] {
       location: it["location"] ? String(it["location"]) : null,
       description: it["description"] ? String(it["description"]) : null,
       htmlLink: String(it["htmlLink"] ?? ""),
+      meetLink: (() => {
+        // Try conferenceData.entryPoints first, then legacy hangoutLink.
+        const cd = it["conferenceData"] as Record<string, unknown> | undefined;
+        if (cd) {
+          const eps = (cd["entryPoints"] as { entryPointType?: string; uri?: string }[] | undefined) ?? [];
+          const video = eps.find((ep) => ep.entryPointType === "video");
+          if (video?.uri) return video.uri;
+        }
+        if (it["hangoutLink"]) return String(it["hangoutLink"]);
+        return null;
+      })(),
     }));
 }
 

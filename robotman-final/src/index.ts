@@ -23,6 +23,7 @@ import { GranolaAuth } from "./granola/oauth.js";
 import { handleGoogleRoutes } from "./google/routes.js";
 import { handleGranolaRoutes } from "./granola/routes.js";
 import { SlackWorkspaceAuth } from "./slack/workspace-oauth.js";
+import { UserContextService } from "./identity/user-context.js";
 import { handleSlackWorkspaceRoutes } from "./slack/workspace-routes.js";
 import { initNotifications } from "./slack/notifications.js";
 
@@ -72,6 +73,7 @@ async function main(): Promise<void> {
   const slackWorkspaceAuth = credentials.enabled && config.slack.oauthConfigured
     ? new SlackWorkspaceAuth(credentials)
     : null;
+  const userContextService = credentials.enabled ? new UserContextService(repo) : null;
 
   console.log(
     `[boot] connections: ${credentials.enabled ? "enabled (/connect)" : "disabled (set CREDENTIAL_ENC_KEY)"}` +
@@ -110,7 +112,7 @@ async function main(): Promise<void> {
     let resolvedAgent: AgentType | undefined;
     const getAgent = () => resolvedAgent;
 
-    const app = createSlackApp(api, getAgent, credentials, googleAuth, granolaAuth, slackWorkspaceAuth);
+    const app = createSlackApp(api, getAgent, credentials, googleAuth, granolaAuth, slackWorkspaceAuth, userContextService);
 
     if (config.anthropic.configured) {
       const { Agent } = await import("./agent/index.js");

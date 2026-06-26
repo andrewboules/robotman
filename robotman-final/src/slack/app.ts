@@ -29,8 +29,10 @@ import { encodeState } from "../google/oauth.js";
 import { encodeGranolaState, generatePKCE } from "../granola/oauth.js";
 import type { SlackWorkspaceAuth } from "../slack/workspace-oauth.js";
 import { buildSlackAuthUrl } from "../slack/workspace-oauth.js";
-import { sendGmail, type GmailDraft } from "../google/gmail.js";
+import { sendGmail, gcalCreateEvent, type GmailDraft } from "../google/gmail.js";
+import type { CalInviteDraft } from "../agent/tools.js";
 import { IdentityResolver } from "../identity/identity.js";
+import { UserContextService, parsePersistTags, stripPersistTags } from "../identity/user-context.js";
 import { formatMetrics, formatStale } from "./format.js";
 import { registerConnectHandlers } from "./connect.js";
 
@@ -53,7 +55,8 @@ export function createSlackApp(
   credentials?: CredentialService,
   google?: GoogleAuth | null,
   granolaAuth?: GranolaAuth | null,
-  slackWorkspaceAuth?: SlackWorkspaceAuth | null
+  slackWorkspaceAuth?: SlackWorkspaceAuth | null,
+  userContextService?: UserContextService | null
 ) {
   const app = new App({
     token: config.slack.botToken,
@@ -68,6 +71,7 @@ export function createSlackApp(
 
   // Staged email drafts awaiting Send confirmation.
   const pendingSends = new Map<string, { slackUserId: string; draft: GmailDraft }>();
+  const pendingInvites = new Map<string, { slackUserId: string; draft: CalInviteDraft }>();
 
   /** Build a Google OAuth connect button for a given Slack user. */
   function googleConnectBlocks(slackUserId: string): unknown[] | null {
@@ -166,6 +170,101 @@ export function createSlackApp(
     ];
   }
 
+  function inviteConfirmBlocks(text: string, draft: CalInviteDraft, slackUserId: string): unknown[] {
+    const id = randomUUID();
+    if (pendingInvites.size >= 200) {
+      const oldest = pendingInvites.keys().next().value;
+      if (oldest) pendingInvites.delete(oldest);
+    }
+    pendingInvites.set(id, { slackUserId, draft });
+    const attendeeStr = draft.attendees.length ? draft.attendees.join(", ") : "no attendees";
+    const meetNote = draft.addMeetLink ? "✅ Meet link will be generated" : "No Meet link";
+    return [
+      { type: "section", text: { type: "mrkdwn", text } },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text:
+            `*Title:* ${draft.summary}
+` +
+            `*Start:* ${draft.start}
+` +
+            `*End:* ${draft.end}
+` +
+            `*Attendees:* ${attendeeStr}
+` +
+            (draft.description ? `*Description:* ${draft.description}
+` : "") +
+            (draft.location ? `*Location:* ${draft.location}
+` : "") +
+            `*Meet link:* ${meetNote}`,
+        },
+      },
+      {
+        type: "actions",
+        elements: [
+          { type: "button", action_id: "gcal_confirm", value: id, style: "primary", text: { type: "plain_text", text: "Create Event" } },
+          { type: "button", action_id: "gcal_cancel", value: id, style: "danger", text: { type: "plain_text", text: "Cancel" } },
+        ],
+      },
+    ];
+  }
+
+  app.action("gcal_confirm", async ({ ack, body, action, respond }) => {
+    await ack();
+    const id = (action as { value?: string }).value ?? "";
+    const pending = pendingInvites.get(id);
+    const clicker = (body as { user?: { id?: string } }).user?.id;
+    if (!pending || !google) {
+      await respond({ replace_original: true, text: "This invite is no longer available." });
+      return;
+    }
+    if (clicker !== pending.slackUserId) {
+      await respond({ replace_original: false, text: "Only the person who staged this invite can create it." });
+      return;
+    }
+    try {
+      const token = await google.getAccessToken(pending.slackUserId);
+      if (!token) {
+        await respond({ replace_original: true, text: "Your Google connection expired — reconnect and try again." });
+        return;
+      }
+      const { event, status, error } = await gcalCreateEvent(token, pending.draft);
+      pendingInvites.delete(id);
+      if (!event) {
+        await respond({ replace_original: true, text: `❌ Failed to create event (HTTP ${status}): ${error ?? "unknown error"}` });
+        return;
+      }
+      const meetStr = event.meetLink ? `
+*Meet link:* ${event.meetLink}` : "";
+      const invitedStr = event.attendees.length ? `
+*Invites sent to:* ${event.attendees.join(", ")}` : "";
+      await respond({
+        replace_original: true,
+        text:
+          `✅ *Calendar invite created!*
+` +
+          `*Title:* ${event.summary}
+` +
+          `*Start:* ${event.start}
+` +
+          `*End:* ${event.end}` +
+          meetStr + invitedStr +
+          `
+*Event link:* ${event.htmlLink}`,
+      });
+    } catch (err) {
+      await respond({ replace_original: true, text: `❌ Calendar error: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  });
+
+  app.action("gcal_cancel", async ({ ack, action, respond }) => {
+    await ack();
+    pendingInvites.delete((action as { value?: string }).value ?? "");
+    await respond({ replace_original: true, text: "🚫 Calendar invite cancelled." });
+  });
+
   app.action("gmail_confirm", async ({ ack, body, action, respond }) => {
     await ack();
     const id = (action as { value?: string }).value ?? "";
@@ -214,32 +313,59 @@ export function createSlackApp(
       return;
     }
     try {
-      const info = await client.users.info({ user: m.user });
+      let info: Awaited<ReturnType<typeof client.users.info>> | null = null;
+      try { info = await client.users.info({ user: m.user }); } catch { /* fall through */ }
+      const profile = info?.user?.profile as Record<string, unknown> | undefined;
       const user = identity.resolve(
         m.user,
-        info.user?.profile?.email ?? null,
-        info.user?.real_name ?? null
+        (profile?.["email"] as string | undefined) ?? null,
+        (profile?.["real_name"] as string | undefined) ?? (info?.user?.real_name as string | undefined) ?? null,
+        (info?.user as Record<string, unknown> | undefined)?.["tz"] as string | undefined ?? null,
+        (profile?.["first_name"] as string | undefined) ?? null,
+        typeof (info?.user as Record<string, unknown> | undefined)?.["tz_offset"] === "number"
+          ? ((info?.user as Record<string, unknown>)["tz_offset"] as number)
+          : null
       );
+      // Prefix message with sender identity for multi-user thread awareness
+      const tz = user.timezone ?? "UTC";
+      const fromTag = `[FROM: ${user.displayName ?? user.slackUserId} | ${user.email ?? "no-email"} | ${tz}]`;
+      const taggedText = `${fromTag} ${m.text}`;
+
+      // Load persistent context for this user
+      const persistentCtx = userContextService
+        ? await userContextService.get(user.slackUserId).catch(() => ({} as Record<string, string>))
+        : {};
+
       const reply = await agent.ask({
         user,
         channel: m.channel,
         threadTs: m.thread_ts ?? null,
-        text: m.text,
+        text: taggedText,
+        persistentContext: persistentCtx,
       });
+
+      // Parse and save any [PERSIST: key=value] tags from the reply
+      const persistPairs = parsePersistTags(reply.text);
+      if (persistPairs.length && userContextService) {
+        await userContextService.setMany(user.slackUserId, persistPairs).catch(() => {});
+      }
+      const displayText = stripPersistTags(reply.text);
 
       let blocks: unknown[] | undefined;
       if (reply.pendingSend) {
         blocks = sendConfirmBlocks(reply.text, reply.pendingSend, user.slackUserId);
+      } else if (reply.pendingInvite) {
+        blocks = inviteConfirmBlocks(reply.text, reply.pendingInvite, user.slackUserId);
       } else if (reply.connectProviders?.length) {
         const buttons = connectButtonsFor(reply.connectProviders, user.slackUserId);
         if (buttons.length) {
           blocks = [
-            { type: "section", text: { type: "mrkdwn", text: reply.text } },
+            { type: "section", text: { type: "mrkdwn", text: displayText } },
             { type: "actions", elements: buttons },
           ];
         }
       }
-      await say({ text: reply.text, thread_ts: m.thread_ts, blocks });
+      await say({ text: displayText, thread_ts: m.thread_ts, blocks });
     } catch (err) {
       await say({
         text: `Sorry — something went wrong: ${err instanceof Error ? err.message : String(err)}`,

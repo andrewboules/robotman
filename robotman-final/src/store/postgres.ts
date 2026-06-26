@@ -103,6 +103,15 @@ export class PostgresRepository implements Repository {
         PRIMARY KEY (slack_user_id, provider)
       );
     `);
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS user_context (
+        slack_user_id TEXT NOT NULL,
+        key           TEXT NOT NULL,
+        value         TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        PRIMARY KEY (slack_user_id, key)
+      );
+    `);
   }
 
   async upsertCredential(row: CredentialRow): Promise<void> {
@@ -140,6 +149,24 @@ export class PostgresRepository implements Repository {
     await this.pool.query(
       `DELETE FROM user_credentials WHERE slack_user_id = $1 AND provider = $2`,
       [slackUserId, provider]
+    );
+  }
+
+  async getUserContext(slackUserId: string): Promise<Record<string, string>> {
+    const { rows } = await this.pool.query<{ key: string; value: string }>(
+      `SELECT key, value FROM user_context WHERE slack_user_id = $1 ORDER BY key`,
+      [slackUserId]
+    );
+    return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+  }
+
+  async setUserContext(slackUserId: string, key: string, value: string): Promise<void> {
+    const now = new Date().toISOString();
+    await this.pool.query(
+      `INSERT INTO user_context (slack_user_id, key, value, updated_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (slack_user_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+      [slackUserId, key, value, now]
     );
   }
 

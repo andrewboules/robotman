@@ -17,7 +17,14 @@ export interface AppUser {
   /** Slack user id (e.g. U12345). The stable handle we key everything on. */
   slackUserId: string;
   email: string | null;
+  /** Full display name / real_name from Slack profile. */
   displayName: string | null;
+  /** First name from Slack profile (for natural greeting). */
+  firstName: string | null;
+  /** IANA timezone string from Slack profile (e.g. "America/Los_Angeles"). */
+  timezone: string | null;
+  /** UTC offset in seconds (e.g. -25200 for PT). */
+  tzOffset: number | null;
 }
 
 export type OAuthProvider = "google" | "slack_user";
@@ -58,11 +65,21 @@ export class InMemoryTokenStore implements TokenStore {
  * profile email (from users.info); later this can enrich from a directory.
  */
 export class IdentityResolver {
-  resolve(slackUserId: string, email?: string | null, displayName?: string | null): AppUser {
+  resolve(
+    slackUserId: string,
+    email?: string | null,
+    displayName?: string | null,
+    timezone?: string | null,
+    firstName?: string | null,
+    tzOffset?: number | null
+  ): AppUser {
     return {
       slackUserId,
       email: email ?? null,
       displayName: displayName ?? null,
+      firstName: firstName ?? null,
+      timezone: timezone ?? null,
+      tzOffset: tzOffset ?? null,
     };
   }
 }

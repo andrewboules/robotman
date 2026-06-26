@@ -59,6 +59,7 @@ export interface ToolContext {
   connectRequest: { providers: string[] };
   /** Mutable: a write tool stages a draft here for Slack to confirm. */
   pendingSend: { draft?: GmailDraft };
+  pendingInvite: { draft?: CalInviteDraft };
 }
 
 export interface ToolResult {
@@ -681,7 +682,8 @@ const gcalListEventsTool: AgentTool = {
       const lines = events.map((e) => {
         const attendeeStr = e.attendees.length ? ` | attendees: ${e.attendees.join(", ")}` : "";
         const loc = e.location ? ` | location: ${e.location}` : "";
-        return `• ${e.summary} | start: ${e.start} | end: ${e.end}${loc}${attendeeStr} | link: ${e.htmlLink}`;
+        const meet = e.meetLink ? ` | meet: ${e.meetLink}` : "";
+        return `• ${e.summary} | start: ${e.start} | end: ${e.end}${loc}${meet}${attendeeStr} | link: ${e.htmlLink}`;
       });
 
       return {
@@ -760,10 +762,9 @@ const gcalCreateEventTool: AgentTool = {
       "Create a Google Calendar event and send invites to attendees. " +
       "Use when the user asks to schedule a meeting, book an interview, send a calendar invite, " +
       "or block time. " +
-      "ALWAYS stage the invite first: show the user a summary (title, time, attendees, Meet link) " +
-      "and wait for their confirmation before creating it — UNLESS they said 'just send it'. " +
-      "If the user hasn't specified a time yet, call gcal_find_availability first to suggest a slot. " +
-      "Set add_meet_link=true to auto-generate a Google Meet conference link.",
+      "Stages the invite for user confirmation via a Slack button before creating it. " +
+      "If the user hasn't specified a time, call gcal_find_availability first to suggest a slot. " +
+      "Set add_meet_link=true (default) to auto-generate a Google Meet conference link.",
     input_schema: {
       type: "object",
       properties: {
@@ -778,10 +779,6 @@ const gcalCreateEventTool: AgentTool = {
         description: { type: "string", description: "Optional body / agenda text for the invite." },
         location: { type: "string", description: "Optional location or room name." },
         add_meet_link: { type: "boolean", description: "Auto-generate a Google Meet link (default true)." },
-        confirmed: {
-          type: "boolean",
-          description: "Set true only after the user has explicitly confirmed they want to send the invite.",
-        },
         calendar_id: { type: "string", description: "Calendar to create the event on. Default: 'primary'." },
       },
       required: ["summary", "start", "end"],
@@ -1161,6 +1158,93 @@ const granolaQueryTool: AgentTool = {
   },
 };
 
+
+// ---------------------------------------------------------------------------
+// Notion API tool
+// ---------------------------------------------------------------------------
+
+const notionApiTool: AgentTool = {
+  def: {
+    name: "notion_api",
+    description:
+      "Call the Notion API on behalf of the user. Supports GET, POST, and PATCH. " +
+      "Automatically adds the required Notion-Version: 2022-06-28 header and the user's " +
+      "stored bearer token. Use for searching pages/databases, querying databases, reading " +
+      "page content, creating pages, or updating existing pages. " +
+      "The user must have connected Notion via /connect (provider: 'notion', " +
+      "base URL: https://api.notion.com). " +
+      "Common paths: POST /v1/search, POST /v1/databases/{id}/query, GET /v1/pages/{id}, " +
+      "GET /v1/blocks/{id}/children, POST /v1/pages, PATCH /v1/pages/{id}.",
+    input_schema: {
+      type: "object",
+      properties: {
+        method: {
+          type: "string",
+          enum: ["GET", "POST", "PATCH"],
+          description: "HTTP method. Default: GET.",
+        },
+        path: {
+          type: "string",
+          description: "Notion API path, e.g. /v1/search or /v1/databases/{id}/query.",
+        },
+        body: {
+          type: "object",
+          description: "Request body for POST/PATCH calls.",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  async run(input, ctx) {
+    const path = String(input.path ?? "").trim();
+    const method = (String(input.method ?? "GET").toUpperCase()) as "GET" | "POST" | "PATCH";
+    if (!path) return { text: "A Notion API path is required.", citations: [] };
+
+    const notionCred = await ctx.credentials.get(ctx.user.slackUserId, "notion");
+    if (!notionCred?.secret) {
+      requestConnect(ctx, "notion");
+      return {
+        text: "Notion isn't connected yet. Use the Connect button to add your Notion API key.",
+        citations: [],
+      };
+    }
+
+    const baseUrl = notionCred.baseUrl?.replace(/\/$/, "") ?? "https://api.notion.com";
+    const fullUrl = `${baseUrl}${path.startsWith("/") ? path : "/" + path}`;
+
+    try {
+      const url = new URL(fullUrl);
+      if (!["api.notion.com", "www.notion.so"].includes(url.host)) {
+        return { text: `Refusing to call ${url.host}; only api.notion.com is allowed.`, citations: [] };
+      }
+    } catch {
+      return { text: `Invalid Notion URL: ${fullUrl}`, citations: [] };
+    }
+
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${notionCred.secret}`,
+      "Notion-Version": "2022-06-28",
+      Accept: "application/json",
+    };
+    if (method !== "GET") headers["Content-Type"] = "application/json";
+
+    try {
+      const res = await fetch(fullUrl, {
+        method,
+        headers,
+        body: method !== "GET" && input.body ? JSON.stringify(input.body) : undefined,
+      });
+      const raw = await res.text();
+      const body = raw.length > 8000 ? raw.slice(0, 8000) + "\n…[truncated]" : raw;
+      if (!res.ok) {
+        return { text: `Notion API error (HTTP ${res.status}): ${body}`, citations: [] };
+      }
+      return { text: `Notion API response (${method} ${path}):\n${body}`, citations: [] };
+    } catch (err) {
+      return { text: `Notion request failed: ${err instanceof Error ? err.message : String(err)}`, citations: [] };
+    }
+  },
+};
 // ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
@@ -1179,6 +1263,7 @@ export const tools: AgentTool[] = [
   gcalListEventsTool,
   gcalFindAvailabilityTool,
   gcalCreateEventTool,
+  notionApiTool,
   driveSearchTool,
   driveReadFileTool,
   granolaListMeetingsTool,
