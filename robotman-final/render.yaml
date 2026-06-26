@@ -1,0 +1,51 @@
+# Render Blueprint — provisions the service + Postgres together.
+# Deploy: push this repo to GitHub, then in Render: New > Blueprint > pick the repo.
+# Render reads this file, creates both resources, and prompts you to paste the
+# secrets marked `sync: false` in the dashboard. Nothing else to configure.
+services:
+  - type: web
+    name: recruiting-orchestration
+    runtime: docker
+    plan: starter # keeps the process always-on (free tier sleeps; bad for a bot + cron)
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Injected automatically from the database below — do not set by hand.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: orchestration-db
+          property: connectionString
+      # Secrets: Render will prompt you to enter these on first deploy.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # Encrypts per-user connection keys + Google tokens. Auto-generated once.
+      - key: CREDENTIAL_ENC_KEY
+        generateValue: true
+      # Google OAuth (Gmail/Calendar/Drive). Set redirect URI in Google Console
+      # to https://<your-service>.onrender.com/oauth/google/callback
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: ASHBY_API_KEY
+        sync: false
+      - key: GEM_API_KEY
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_APP_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      # Tunables with sensible defaults.
+      - key: STALE_AFTER_DAYS
+        value: "7"
+      - key: SYNC_CRON
+        value: "*/15 * * * *"
+      - key: NODE_ENV
+        value: production
+
+databases:
+  - name: orchestration-db
+    plan: basic-256mb # smallest paid tier; upgrade as data grows
+    postgresMajorVersion: "16"
